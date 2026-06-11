@@ -3,6 +3,7 @@ param(
     [switch]$DryRun,
     [switch]$Run,
     [switch]$Headless,
+    [string]$StatId,
     [string]$LogPath
 )
 
@@ -11,9 +12,10 @@ $ProgressPreference    = 'SilentlyContinue'
 
 if ($Headless) { $Run = $true }
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
+$ScriptUrl     = 'https://script.nep.red'
 $StatsUrl      = 'https://script.nep.red/stat'
-$RunId         = [guid]::NewGuid().ToString()
+$RunId         = if ($StatId) { $StatId } else { [guid]::NewGuid().ToString() }
 
 if (-not $LogPath) {
     $logBase = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }
@@ -22,6 +24,7 @@ if (-not $LogPath) {
 $script:Removed = 0
 $script:Skipped = 0
 $script:Errors  = 0
+$script:LoadedHives = New-Object System.Collections.Generic.List[string]
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -48,6 +51,7 @@ function Send-Stat([string]$Phase) {
 }
 
 if (-not $DryRun -and -not $Run) {
+    if (-not [Environment]::UserInteractive) { return }
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "   Pulse Browser (PUA:Pulse) Removal" -ForegroundColor Cyan
@@ -57,7 +61,8 @@ if (-not $DryRun -and -not $Run) {
     Write-Host "   [2]  Remove Pulse Browser now" -ForegroundColor Gray
     Write-Host "   [3]  Exit" -ForegroundColor Gray
     Write-Host ""
-    $choice = Read-Host "Select an option (1/2/3)"
+    $choice = $null
+    try { $choice = Read-Host "Select an option (1/2/3)" } catch { return }
     switch ($choice) {
         '1' { $DryRun = $true }
         '2' { $Run = $true }
@@ -67,15 +72,25 @@ if (-not $DryRun -and -not $Run) {
 
 if ($Run -and -not (Test-Admin)) {
     try {
-        if ($PSCommandPath) {
-            $selfPath = $PSCommandPath
-        } else {
-            $selfPath = Join-Path $env:TEMP 'Remove-PulseBrowser.ps1'
-            $MyInvocation.MyCommand.ScriptBlock.ToString() | Out-File -FilePath $selfPath -Encoding UTF8 -Force
-        }
         $modeArg = if ($Headless) { '-Headless' } else { '-Run' }
-        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",$modeArg)
-        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop
+        $launch  = $null
+        if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue)) {
+            $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",$modeArg,'-StatId',$RunId)
+        } else {
+            $selfTxt = ''
+            try { $selfTxt = $MyInvocation.MyCommand.ScriptBlock.ToString() } catch {}
+            if ($selfTxt.Length -gt 4000 -and ($selfTxt -match 'Remove-PathForce')) {
+                $selfPath = Join-Path $env:TEMP 'Remove-PulseBrowser.ps1'
+                $selfTxt | Out-File -FilePath $selfPath -Encoding UTF8 -Force
+                $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",$modeArg,'-StatId',$RunId)
+            } else {
+                $boot = Join-Path $env:TEMP 'PulseRemove.boot.ps1'
+                "& ([scriptblock]::Create((Invoke-RestMethod -Uri '$ScriptUrl' -TimeoutSec 30))) $modeArg -StatId '$RunId'" |
+                    Out-File -FilePath $boot -Encoding UTF8 -Force
+                $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$boot`"")
+            }
+        }
+        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $launch -ErrorAction Stop
         return
     } catch {
         Write-Host "[!] Elevation declined/unavailable - continuing with current privileges." -ForegroundColor Yellow
@@ -117,11 +132,11 @@ function Section([string]$t) {
 }
 
 function Remove-PathForce([string]$path) {
-    if (-not (Test-Path -LiteralPath $path)) { return $true }
+    if (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) { return $true }
     for ($i = 0; $i -lt 5; $i++) {
         try {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
-            if (-not (Test-Path -LiteralPath $path)) { return $true }
+            if (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) { return $true }
         } catch {}
         & takeown.exe /F "$path" /R /A /D Y *> $null
         & icacls.exe "$path" /grant "*S-1-5-32-544:(F)" /T /C /Q *> $null
@@ -132,36 +147,41 @@ function Remove-PathForce([string]$path) {
             (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue).Attributes = 'Normal'
         } catch {}
         try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop } catch {}
-        if (-not (Test-Path -LiteralPath $path)) { return $true }
+        if (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) { return $true }
         Start-Sleep -Milliseconds 400
     }
     try {
         $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('pulsedel_' + [System.IO.Path]::GetRandomFileName())
         Move-Item -LiteralPath $path -Destination $stage -Force -ErrorAction Stop
         try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop } catch {}
-        if (-not (Test-Path -LiteralPath $path)) {
-            if (Test-Path -LiteralPath $stage) {
+        if (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) {
+            if (Test-Path -LiteralPath $stage -ErrorAction SilentlyContinue) {
                 Write-Host "    [staged] in use - moved out of install path (neutralized): $stage" -ForegroundColor DarkYellow
             }
             return $true
         }
     } catch {}
-    return (-not (Test-Path -LiteralPath $path))
+    return (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue))
 }
 
 function Remove-RegForce([string]$psPath) {
-    if (-not (Test-Path $psPath)) { return $true }
+    if (-not (Test-Path $psPath -ErrorAction SilentlyContinue)) { return $true }
     try {
         Remove-Item -LiteralPath $psPath -Recurse -Force -ErrorAction Stop
-        if (-not (Test-Path $psPath)) { return $true }
+        if (-not (Test-Path $psPath -ErrorAction SilentlyContinue)) { return $true }
     } catch {}
     $rp = $psPath -replace '^Microsoft\.PowerShell\.Core\\Registry::',''
-    $rp = $rp -replace '^HKEY_LOCAL_MACHINE','HKLM' -replace '^HKEY_CURRENT_USER','HKCU' `
-              -replace '^HKEY_CLASSES_ROOT','HKCR' -replace '^HKEY_USERS','HKU'
-    $rp = $rp -replace '^HKLM:\\','HKLM\' -replace '^HKCU:\\','HKCU\' `
-              -replace '^HKCR:\\','HKCR\' -replace '^HKU:\\','HKU\'
+    $rp = $rp -replace '^Registry::',''
+    $rp = $rp -replace '^HKEY_LOCAL_MACHINE','HKLM'
+    $rp = $rp -replace '^HKEY_CURRENT_USER','HKCU'
+    $rp = $rp -replace '^HKEY_CLASSES_ROOT','HKCR'
+    $rp = $rp -replace '^HKEY_USERS','HKU'
+    $rp = $rp -replace '^HKLM:\\','HKLM\'
+    $rp = $rp -replace '^HKCU:\\','HKCU\'
+    $rp = $rp -replace '^HKCR:\\','HKCR\'
+    $rp = $rp -replace '^HKU:\\','HKU\'
     & reg.exe delete "$rp" /f *> $null
-    return (-not (Test-Path $psPath))
+    return (-not (Test-Path $psPath -ErrorAction SilentlyContinue))
 }
 
 function Invoke-Action {
@@ -181,10 +201,13 @@ function Invoke-Action {
     }
 }
 
+$hasSchedCmd = [bool](Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)
+
 Section "Stopping Pulse processes"
-$procNames  = @('PulseBrowser','Pulse BrowserUpdate','PulseBrowserUpdate','PulseSoftwareUpdate','setup')
-$genericExe = @('updater','enterprise_companion')
-foreach ($pass in 1..2) {
+$procNames  = @('PulseBrowser','Pulse BrowserUpdate','PulseBrowserUpdate','PulseSoftwareUpdate')
+$genericExe = @('updater','enterprise_companion','setup')
+$passes = if ($DryRun) { 1 } else { 2 }
+foreach ($pass in 1..$passes) {
     Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
         $p = $_; $path = $null
         try { $path = $p.Path } catch {}
@@ -202,9 +225,11 @@ foreach ($pass in 1..2) {
     }
 }
 
-Section "Closing processes with Pulse modules loaded (no reboot)"
+Section "Closing other processes with Pulse modules loaded (no reboot)"
 Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
-    $p = $_; $hit = $null
+    $p = $_
+    if ($procNames -contains $p.ProcessName) { return }
+    $hit = $null
     try { $hit = $p.Modules | Where-Object { $_.FileName -match $PulseRegex } } catch {}
     if ($hit) {
         if ($p.ProcessName -eq 'explorer') {
@@ -223,13 +248,15 @@ Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
 }
 
 Section "Removing scheduled tasks"
-Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
-    $t = $_; $hay = @($t.TaskName, $t.TaskPath)
-    try { $hay += ($t.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) } catch {}
-    if (($hay -join ' ') -match $PulseRegex) {
-        $full = ($t.TaskPath + $t.TaskName)
-        Invoke-Action "task $full" {
-            Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+if ($hasSchedCmd) {
+    Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+        $t = $_; $hay = @($t.TaskName, $t.TaskPath)
+        try { $hay += ($t.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) } catch {}
+        if (($hay -join ' ') -match $PulseRegex) {
+            $full = ($t.TaskPath + $t.TaskName)
+            Invoke-Action "task $full" {
+                Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+            }
         }
     }
 }
@@ -263,17 +290,65 @@ Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
     }
 }
 
+Section "Discovering user registry hives (all profiles)"
+$softwareHiveRoots = New-Object System.Collections.Generic.List[string]
+$classesHiveRoots  = New-Object System.Collections.Generic.List[string]
+$loadedSids = @{}
+Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | ForEach-Object {
+    $n = $_.PSChildName
+    if ($n -match '^S-1-5-21-[\d-]+_Classes$') {
+        $classesHiveRoots.Add("Registry::HKEY_USERS\$n")
+        $loadedSids[($n -replace '_Classes$','')] = $true
+    } elseif ($n -match '^S-1-5-21-[\d-]+$') {
+        $softwareHiveRoots.Add("Registry::HKEY_USERS\$n")
+        $loadedSids[$n] = $true
+    }
+}
+if (Test-Admin) {
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
+        $sid = $_.PSChildName
+        if ($sid -match '^S-1-5-21-[\d-]+$' -and -not $loadedSids[$sid]) {
+            $pp = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+            if ($pp) {
+                $nt = Join-Path $pp 'NTUSER.DAT'
+                if (Test-Path -LiteralPath $nt -ErrorAction SilentlyContinue) {
+                    & reg.exe load "HKU\PulseTmp_$sid" "$nt" *> $null
+                    if ($LASTEXITCODE -eq 0) {
+                        $script:LoadedHives.Add("HKU\PulseTmp_$sid")
+                        $softwareHiveRoots.Add("Registry::HKEY_USERS\PulseTmp_$sid")
+                    }
+                }
+                $uc = Join-Path $pp 'AppData\Local\Microsoft\Windows\UsrClass.dat'
+                if (Test-Path -LiteralPath $uc -ErrorAction SilentlyContinue) {
+                    & reg.exe load "HKU\PulseTmpC_$sid" "$uc" *> $null
+                    if ($LASTEXITCODE -eq 0) {
+                        $script:LoadedHives.Add("HKU\PulseTmpC_$sid")
+                        $classesHiveRoots.Add("Registry::HKEY_USERS\PulseTmpC_$sid")
+                    }
+                }
+            }
+        }
+    }
+}
+Write-Host "    user software hives: $($softwareHiveRoots.Count)   class hives: $($classesHiveRoots.Count)" -ForegroundColor DarkGray
+
+$classContainers = New-Object System.Collections.Generic.List[string]
+$classContainers.Add('HKLM:\Software\Classes')
+$classContainers.Add('HKLM:\Software\Wow6432Node\Classes')
+foreach ($r in $softwareHiveRoots) { $classContainers.Add("$r\Software\Classes") }
+foreach ($r in $classesHiveRoots)  { $classContainers.Add($r) }
+
 Section "Removing autostart (Run) entries"
-$runKeys = @(
-    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
-    'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce',
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce',
-    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run',
-    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
-)
+$runKeys = New-Object System.Collections.Generic.List[string]
+foreach ($b in @('HKLM:\Software\Microsoft\Windows\CurrentVersion','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion')) {
+    $runKeys.Add("$b\Run"); $runKeys.Add("$b\RunOnce")
+}
+foreach ($r in $softwareHiveRoots) {
+    $runKeys.Add("$r\Software\Microsoft\Windows\CurrentVersion\Run")
+    $runKeys.Add("$r\Software\Microsoft\Windows\CurrentVersion\RunOnce")
+}
 foreach ($rk in $runKeys) {
-    if (-not (Test-Path $rk)) { continue }
+    if (-not (Test-Path $rk -ErrorAction SilentlyContinue)) { continue }
     $props = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
     if (-not $props) { continue }
     foreach ($p in $props.PSObject.Properties) {
@@ -286,29 +361,52 @@ foreach ($rk in $runKeys) {
     }
 }
 
+Section "Removing App Paths"
+$appPathRoots = New-Object System.Collections.Generic.List[string]
+$appPathRoots.Add('HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths')
+$appPathRoots.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths')
+foreach ($r in $softwareHiveRoots) { $appPathRoots.Add("$r\Software\Microsoft\Windows\CurrentVersion\App Paths") }
+foreach ($apr in $appPathRoots) {
+    if (-not (Test-Path $apr -ErrorAction SilentlyContinue)) { continue }
+    Get-ChildItem -Path $apr -ErrorAction SilentlyContinue | ForEach-Object {
+        $k = $_; $match = ($k.PSChildName -match $PulseRegex)
+        if (-not $match) {
+            try {
+                $d = (Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue).'(default)'
+                if ($d -and ($d -match $PulseRegex)) { $match = $true }
+            } catch {}
+        }
+        if ($match) {
+            Invoke-Action "AppPath $($k.PSChildName)" { if (-not (Remove-RegForce $k.PSPath)) { throw 'key remained' } }
+        }
+    }
+}
+
 Section "Removing registry keys (vendor / policies)"
-$vendorKeys = @(
-    'HKCU:\Software\PulseSoftware',
-    'HKLM:\Software\PulseSoftware',
-    'HKLM:\Software\WOW6432Node\PulseSoftware',
-    'HKCU:\Software\Policies\PulseSoftware',
-    'HKLM:\Software\Policies\PulseSoftware',
-    'HKLM:\Software\WOW6432Node\Policies\PulseSoftware'
-)
+$vendorKeys = New-Object System.Collections.Generic.List[string]
+$vendorKeys.Add('HKLM:\Software\PulseSoftware')
+$vendorKeys.Add('HKLM:\Software\WOW6432Node\PulseSoftware')
+$vendorKeys.Add('HKLM:\Software\Policies\PulseSoftware')
+$vendorKeys.Add('HKLM:\Software\WOW6432Node\Policies\PulseSoftware')
+foreach ($r in $softwareHiveRoots) {
+    $vendorKeys.Add("$r\Software\PulseSoftware")
+    $vendorKeys.Add("$r\Software\Policies\PulseSoftware")
+}
 foreach ($k in $vendorKeys) {
-    if (Test-Path $k) {
+    if (Test-Path $k -ErrorAction SilentlyContinue) {
         Invoke-Action "regkey $k" { if (-not (Remove-RegForce $k)) { throw "key remained" } }
     }
 }
 
-Section "Removing COM / AppID / TypeLib registrations (Pulse GUIDs only)"
-$comRoots = @(
-    'HKCU:\Software\Classes\CLSID','HKLM:\Software\Classes\CLSID','HKLM:\Software\Classes\WOW6432Node\CLSID',
-    'HKCU:\Software\Classes\AppID','HKLM:\Software\Classes\AppID','HKLM:\Software\Classes\WOW6432Node\AppID',
-    'HKCU:\Software\Classes\TypeLib','HKLM:\Software\Classes\TypeLib','HKLM:\Software\Classes\WOW6432Node\TypeLib'
-)
+Section "Removing COM / AppID / TypeLib / Interface registrations (Pulse only)"
+$comRoots = New-Object System.Collections.Generic.List[string]
+foreach ($c in $classContainers) {
+    foreach ($leaf in @('CLSID','AppID','TypeLib','Interface','Wow6432Node\CLSID','Wow6432Node\AppID','Wow6432Node\TypeLib','Wow6432Node\Interface')) {
+        $comRoots.Add("$c\$leaf")
+    }
+}
 foreach ($root in $comRoots) {
-    if (-not (Test-Path $root)) { continue }
+    if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
     Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
         $sub = $_; $remove = $false
         if (Test-IsPulseGuid $sub.PSChildName) { $remove = $true }
@@ -326,8 +424,8 @@ foreach ($root in $comRoots) {
 }
 
 Section "Removing ProgID classes (Pulse)"
-foreach ($cr in @('HKCU:\Software\Classes','HKLM:\Software\Classes','HKLM:\Software\Classes\WOW6432Node')) {
-    if (-not (Test-Path $cr)) { continue }
+foreach ($cr in $classContainers) {
+    if (-not (Test-Path $cr -ErrorAction SilentlyContinue)) { continue }
     Get-ChildItem -Path $cr -ErrorAction SilentlyContinue |
         Where-Object { $_.PSChildName -match $PulseRegex } | ForEach-Object {
             Invoke-Action "ProgID $($_.PSChildName)" { if (-not (Remove-RegForce $_.PSPath)) { throw "key remained" } }
@@ -335,13 +433,12 @@ foreach ($cr in @('HKCU:\Software\Classes','HKLM:\Software\Classes','HKLM:\Softw
 }
 
 Section "Removing Add/Remove Programs (Uninstall) entries"
-$uninstallRoots = @(
-    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-)
+$uninstallRoots = New-Object System.Collections.Generic.List[string]
+$uninstallRoots.Add('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+$uninstallRoots.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
+foreach ($r in $softwareHiveRoots) { $uninstallRoots.Add("$r\Software\Microsoft\Windows\CurrentVersion\Uninstall") }
 foreach ($ur in $uninstallRoots) {
-    if (-not (Test-Path $ur)) { continue }
+    if (-not (Test-Path $ur -ErrorAction SilentlyContinue)) { continue }
     Get-ChildItem -Path $ur -ErrorAction SilentlyContinue | ForEach-Object {
         $key = $_; $remove = (Test-IsPulseGuid $key.PSChildName)
         if (-not $remove) {
@@ -362,12 +459,12 @@ $userRoots.Add($env:USERPROFILE)
 try {
     Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
         $pp = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
-        if ($pp -and (Test-Path -LiteralPath $pp)) { $userRoots.Add($pp) }
+        if ($pp -and (Test-Path -LiteralPath $pp -ErrorAction SilentlyContinue)) { $userRoots.Add($pp) }
     }
 } catch {}
 try {
     $profilesDir = Split-Path -Parent $env:USERPROFILE
-    if ($profilesDir -and (Test-Path -LiteralPath $profilesDir)) {
+    if ($profilesDir -and (Test-Path -LiteralPath $profilesDir -ErrorAction SilentlyContinue)) {
         Get-ChildItem -LiteralPath $profilesDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $userRoots.Add($_.FullName) }
     }
 } catch {}
@@ -386,8 +483,8 @@ foreach ($u in $userRoots) {
 if ($env:ProgramData) { $dirCandidates.Add((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Pulse Browser')) }
 
 foreach ($d in ($dirCandidates | Select-Object -Unique)) {
-    if (Test-Path -LiteralPath $d) {
-        Invoke-Action "dir $d" { if (-not (Remove-PathForce $d)) { } }
+    if (Test-Path -LiteralPath $d -ErrorAction SilentlyContinue) {
+        Invoke-Action "dir $d" { if (-not (Remove-PathForce $d)) { throw 'in use - could not fully remove' } }
     }
 }
 
@@ -402,7 +499,7 @@ $lnkScanRoots += (Join-Path $env:Public 'Desktop')
 if ($env:ProgramData) { $lnkScanRoots += (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') }
 $wsh = New-Object -ComObject WScript.Shell
 foreach ($root in ($lnkScanRoots | Select-Object -Unique)) {
-    if (-not (Test-Path -LiteralPath $root)) { continue }
+    if (-not (Test-Path -LiteralPath $root -ErrorAction SilentlyContinue)) { continue }
     Get-ChildItem -LiteralPath $root -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
         $lnk = $_; $isPulse = ($lnk.Name -match $PulseRegex)
         if (-not $isPulse) {
@@ -412,7 +509,7 @@ foreach ($root in ($lnkScanRoots | Select-Object -Unique)) {
             } catch {}
         }
         if ($isPulse) {
-            Invoke-Action "shortcut $($lnk.FullName)" { if (-not (Remove-PathForce $lnk.FullName)) { } }
+            Invoke-Action "shortcut $($lnk.FullName)" { if (-not (Remove-PathForce $lnk.FullName)) { throw 'in use - could not remove' } }
         }
     }
 }
@@ -421,24 +518,26 @@ Section "Removing temp leftovers"
 $tempRoots = @($env:TEMP, "$env:SystemRoot\Temp")
 foreach ($u in $userRoots) { $tempRoots += (Join-Path $u 'AppData\Local\Temp') }
 foreach ($tr in ($tempRoots | Select-Object -Unique)) {
-    if (-not (Test-Path -LiteralPath $tr)) { continue }
+    if (-not (Test-Path -LiteralPath $tr -ErrorAction SilentlyContinue)) { continue }
     Get-ChildItem -LiteralPath $tr -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match $PulseRegex } | ForEach-Object {
-            Invoke-Action "temp $($_.FullName)" { if (-not (Remove-PathForce $_.FullName)) { } }
+            Invoke-Action "temp $($_.FullName)" { if (-not (Remove-PathForce $_.FullName)) { throw 'in use - could not remove' } }
         }
 }
 
 Section "Removing the Pulse installer (dropper)"
 foreach ($u in $userRoots) {
     $dl = Join-Path $u 'Downloads\setup.exe'
-    if (Test-Path -LiteralPath $dl) {
+    if (Test-Path -LiteralPath $dl -ErrorAction SilentlyContinue) {
         $isPulse = $false
         try {
-            $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($dl))
-            if ($ascii -match 'PulseSoftware|PulseBrowser') { $isPulse = $true }
+            $buf   = [System.IO.File]::ReadAllBytes($dl)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($buf)
+            $uni   = [System.Text.Encoding]::Unicode.GetString($buf)
+            if (($ascii -match 'PulseSoftware|PulseBrowser') -or ($uni -match 'PulseSoftware|PulseBrowser')) { $isPulse = $true }
         } catch {}
         if ($isPulse) {
-            Invoke-Action "dropper $dl" { if (-not (Remove-PathForce $dl)) { } }
+            Invoke-Action "dropper $dl" { if (-not (Remove-PathForce $dl)) { throw 'in use - could not remove' } }
         } else {
             Write-Host "    [skip] $dl is not the Pulse installer" -ForegroundColor DarkGray
         }
@@ -447,11 +546,13 @@ foreach ($u in $userRoots) {
 
 Section "Verification"
 $residual = @()
-foreach ($k in $vendorKeys) { if (Test-Path $k) { $residual += "reg: $k" } }
-foreach ($d in ($dirCandidates | Select-Object -Unique)) { if (Test-Path -LiteralPath $d) { $residual += "dir: $d" } }
-Get-ScheduledTask -ErrorAction SilentlyContinue |
-    Where-Object { (($_.TaskName + $_.TaskPath) -match $PulseRegex) } |
-    ForEach-Object { $residual += "task: $($_.TaskPath)$($_.TaskName)" }
+foreach ($k in $vendorKeys) { if (Test-Path $k -ErrorAction SilentlyContinue) { $residual += "reg: $k" } }
+foreach ($d in ($dirCandidates | Select-Object -Unique)) { if (Test-Path -LiteralPath $d -ErrorAction SilentlyContinue) { $residual += "dir: $d" } }
+if ($hasSchedCmd) {
+    Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object { (($_.TaskName + $_.TaskPath) -match $PulseRegex) } |
+        ForEach-Object { $residual += "task: $($_.TaskPath)$($_.TaskName)" }
+}
 Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
     Where-Object { "$($_.Name) $($_.DisplayName) $($_.PathName)" -match $PulseRegex } |
     ForEach-Object { $residual += "svc: $($_.Name)" }
@@ -464,6 +565,17 @@ if ($residual.Count -eq 0) {
 } else {
     Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
+}
+
+if ($script:LoadedHives.Count -gt 0) {
+    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+    foreach ($h in $script:LoadedHives) {
+        for ($u = 0; $u -lt 3; $u++) {
+            & reg.exe unload $h *> $null
+            if ($LASTEXITCODE -eq 0) { break }
+            [gc]::Collect(); Start-Sleep -Milliseconds 300
+        }
+    }
 }
 
 Send-Stat 'done'

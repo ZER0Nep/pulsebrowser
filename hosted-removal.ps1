@@ -2,11 +2,18 @@
 param(
     [switch]$DryRun,
     [switch]$Run,
+    [switch]$Headless,
     [string]$LogPath
 )
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
+
+if ($Headless) { $Run = $true }
+
+$ScriptVersion = '1.1.0'
+$StatsUrl      = 'https://script.nep.red/stat'
+$RunId         = [guid]::NewGuid().ToString()
 
 if (-not $LogPath) {
     $logBase = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }
@@ -20,6 +27,24 @@ function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Send-Stat([string]$Phase) {
+    try {
+        $payload = @{
+            v        = $ScriptVersion
+            runId    = $RunId
+            phase    = $Phase
+            action   = if ($DryRun) { 'preview' } else { 'remove' }
+            headless = [bool]$Headless
+            admin    = (Test-Admin)
+            removed  = $script:Removed
+            errors   = $script:Errors
+            os       = [string][System.Environment]::OSVersion.Version
+            ps       = [string]$PSVersionTable.PSVersion
+        } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri $StatsUrl -Method Post -Body $payload -ContentType 'application/json' -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
 }
 
 if (-not $DryRun -and -not $Run) {
@@ -48,7 +73,8 @@ if ($Run -and -not (Test-Admin)) {
             $selfPath = Join-Path $env:TEMP 'Remove-PulseBrowser.ps1'
             $MyInvocation.MyCommand.ScriptBlock.ToString() | Out-File -FilePath $selfPath -Encoding UTF8 -Force
         }
-        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",'-Run')
+        $modeArg = if ($Headless) { '-Headless' } else { '-Run' }
+        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",$modeArg)
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop
         return
     } catch {
@@ -57,6 +83,8 @@ if ($Run -and -not (Test-Admin)) {
 }
 
 try { Start-Transcript -Path $LogPath -Append -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+Send-Stat 'start'
 
 $mode = if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE REMOVAL' }
 $ctx  = if (Test-Admin) { 'Administrator' } else { 'Standard user' }
@@ -438,6 +466,8 @@ if ($residual.Count -eq 0) {
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
 }
 
+Send-Stat 'done'
+
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ("  Done. Removed: {0}  Previewed: {1}  Errors: {2}" -f $script:Removed,$script:Skipped,$script:Errors) -ForegroundColor Cyan
@@ -446,7 +476,7 @@ Write-Host "============================================================" -Foreg
 
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
 
-if ([Environment]::UserInteractive) {
+if ([Environment]::UserInteractive -and -not $Headless) {
     Write-Host ""
     try { Read-Host "Press Enter to close" | Out-Null } catch {}
 }

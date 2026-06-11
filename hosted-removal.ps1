@@ -30,7 +30,7 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
     }
 }
 
-$ScriptVersion = '1.3.1'
+$ScriptVersion = '1.3.2'
 $ScriptUrl     = 'https://script.nep.red'
 $StatsUrl      = 'https://script.nep.red/stat'
 $RunId         = if ($StatId) { $StatId } else { [guid]::NewGuid().ToString() }
@@ -67,7 +67,14 @@ function Send-Stat([string]$Phase) {
             os       = [string][System.Environment]::OSVersion.Version
             ps       = [string]$PSVersionTable.PSVersion
         } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri $StatsUrl -Method Post -Body $payload -ContentType 'application/json' -TimeoutSec 5 -ErrorAction Stop | Out-Null
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $req = [System.Net.HttpWebRequest]::Create($StatsUrl)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json'
+        $req.Timeout = 5000
+        $req.ContentLength = $bytes.Length
+        $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
+        $resp = $req.GetResponse(); $resp.Close()
     } catch {}
 }
 

@@ -30,7 +30,7 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
     }
 }
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.3.1'
 $ScriptUrl     = 'https://script.nep.red'
 $StatsUrl      = 'https://script.nep.red/stat'
 $RunId         = if ($StatId) { $StatId } else { [guid]::NewGuid().ToString() }
@@ -43,6 +43,7 @@ $script:Removed = 0
 $script:Skipped = 0
 $script:Errors  = 0
 $script:LoadedHives = New-Object System.Collections.Generic.List[string]
+$MySid = try { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { 'S-1-5-32-544' }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -66,7 +67,7 @@ function Send-Stat([string]$Phase) {
             os       = [string][System.Environment]::OSVersion.Version
             ps       = [string]$PSVersionTable.PSVersion
         } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri $StatsUrl -Method Post -Body $payload -ContentType 'application/json' -TimeoutSec 5 -ErrorAction SilentlyContinue | Out-Null
+        Invoke-RestMethod -Uri $StatsUrl -Method Post -Body $payload -ContentType 'application/json' -TimeoutSec 5 -ErrorAction Stop | Out-Null
     } catch {}
 }
 
@@ -165,9 +166,9 @@ function Remove-PathForce([string]$path) {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
             if (-not (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) { return $true }
         } catch {}
-        & takeown.exe /F "$path" /R /A /D Y *> $null
+        & icacls.exe "$path" /setowner "*$MySid" /T /C /Q *> $null
         & icacls.exe "$path" /grant "*S-1-5-32-544:(F)" /T /C /Q *> $null
-        & icacls.exe "$path" /grant "$($env:USERNAME):(F)" /T /C /Q *> $null
+        & icacls.exe "$path" /grant "*$($MySid):(F)" /T /C /Q *> $null
         try {
             Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue |
                 ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
@@ -245,8 +246,9 @@ foreach ($pass in 1..$passes) {
         if ($isPulse) {
             $desc = "$($p.ProcessName) (PID $($p.Id))" + $(if ($path) { " [$path]" } else { "" })
             Invoke-Action "kill $desc" {
-                Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                 & taskkill.exe /PID $p.Id /T /F *> $null
+                if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { throw 'still running' }
             }
         }
     }
@@ -267,8 +269,9 @@ Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
             }
         } else {
             Invoke-Action "kill $($p.ProcessName) (PID $($p.Id)) - Pulse module loaded" {
-                Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
                 & taskkill.exe /PID $p.Id /T /F *> $null
+                if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { throw 'still running' }
             }
         }
     }
@@ -547,7 +550,7 @@ foreach ($u in $userRoots) { $tempRoots += (Join-Path $u 'AppData\Local\Temp') }
 foreach ($tr in ($tempRoots | Select-Object -Unique)) {
     if (-not (Test-Path -LiteralPath $tr -ErrorAction SilentlyContinue)) { continue }
     Get-ChildItem -LiteralPath $tr -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $PulseRegex } | ForEach-Object {
+        Where-Object { $_.Name -match $PulseRegex -and $_.Name -notmatch '(?i)^(Remove-PulseBrowser\.(log|ps1)|PulseRemove\.boot\.ps1)$' } | ForEach-Object {
             Invoke-Action "temp $($_.FullName)" { if (-not (Remove-PathForce $_.FullName)) { throw 'in use - could not remove' } }
         }
 }
@@ -599,7 +602,7 @@ if ($residual.Count -eq 0) {
 if ($Harden) {
     Section "Hardening (block reinstall - user scope, no admin)"
     $vaxPaths = New-Object System.Collections.Generic.List[string]
-    foreach ($u in $userRoots) {
+    foreach ($u in ($userRoots | Where-Object { $_ -match '(?i)\\Users\\[^\\]+$' -and $_ -notmatch '(?i)\\Users\\(Public|Default|Default User|All Users)$' })) {
         $vaxPaths.Add((Join-Path $u 'AppData\Local\PulseSoftware'))
         $vaxPaths.Add((Join-Path $u 'AppData\Local\Pulse Browser'))
         $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PulseSoftware'))
@@ -618,7 +621,7 @@ if ($Harden) {
                 New-Item -ItemType File -Path $vp -Force -ErrorAction Stop | Out-Null
                 $fi = Get-Item -LiteralPath $vp -Force -ErrorAction SilentlyContinue
                 if ($fi) { $fi.Attributes = 'ReadOnly,Hidden,System' }
-                & icacls.exe "$vp" /inheritance:r /grant:r "$($env:USERNAME):(R)" /deny "*S-1-1-0:(WD,AD,DE,DC)" *> $null
+                & icacls.exe "$vp" /inheritance:r /grant:r "*S-1-5-32-544:(F)" /deny "*S-1-1-0:(WD,AD,DE,DC)" *> $null
                 Write-Host "    [OK ] blocked: $vp" -ForegroundColor Green
                 $script:Removed++
             } catch {

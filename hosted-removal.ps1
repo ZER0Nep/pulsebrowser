@@ -12,7 +12,21 @@ $ProgressPreference    = 'SilentlyContinue'
 
 if ($Headless) { $Run = $true }
 
-$ScriptVersion = '1.2.0'
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue)) {
+    $ps64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path -LiteralPath $ps64 -ErrorAction SilentlyContinue) {
+        try {
+            $reArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+            if ($DryRun)   { $reArgs += '-DryRun' }
+            if ($Headless) { $reArgs += '-Headless' } elseif ($Run) { $reArgs += '-Run' }
+            if ($StatId)   { $reArgs += @('-StatId',$StatId) }
+            Start-Process -FilePath $ps64 -ArgumentList $reArgs -Wait
+            return
+        } catch {}
+    }
+}
+
+$ScriptVersion = '1.2.1'
 $ScriptUrl     = 'https://script.nep.red'
 $StatsUrl      = 'https://script.nep.red/stat'
 $RunId         = if ($StatId) { $StatId } else { [guid]::NewGuid().ToString() }
@@ -90,7 +104,8 @@ if ($Run -and -not (Test-Admin)) {
                 $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$boot`"")
             }
         }
-        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $launch -ErrorAction Stop
+        $psExe = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe' } else { 'powershell.exe' }
+        Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $launch -ErrorAction Stop
         return
     } catch {
         Write-Host "[!] Elevation declined/unavailable - continuing with current privileges." -ForegroundColor Yellow
@@ -165,10 +180,10 @@ function Remove-PathForce([string]$path) {
 }
 
 function Remove-RegForce([string]$psPath) {
-    if (-not (Test-Path $psPath -ErrorAction SilentlyContinue)) { return $true }
+    if (-not (Test-Path -LiteralPath $psPath -ErrorAction SilentlyContinue)) { return $true }
     try {
         Remove-Item -LiteralPath $psPath -Recurse -Force -ErrorAction Stop
-        if (-not (Test-Path $psPath -ErrorAction SilentlyContinue)) { return $true }
+        if (-not (Test-Path -LiteralPath $psPath -ErrorAction SilentlyContinue)) { return $true }
     } catch {}
     $rp = $psPath -replace '^Microsoft\.PowerShell\.Core\\Registry::',''
     $rp = $rp -replace '^Registry::',''
@@ -181,7 +196,7 @@ function Remove-RegForce([string]$psPath) {
     $rp = $rp -replace '^HKCR:\\','HKCR\'
     $rp = $rp -replace '^HKU:\\','HKU\'
     & reg.exe delete "$rp" /f *> $null
-    return (-not (Test-Path $psPath -ErrorAction SilentlyContinue))
+    return (-not (Test-Path -LiteralPath $psPath -ErrorAction SilentlyContinue))
 }
 
 function Invoke-Action {
@@ -308,7 +323,7 @@ if (Test-Admin) {
     Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
         $sid = $_.PSChildName
         if ($sid -match '^S-1-5-21-[\d-]+$' -and -not $loadedSids[$sid]) {
-            $pp = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+            $pp = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
             if ($pp) {
                 $nt = Join-Path $pp 'NTUSER.DAT'
                 if (Test-Path -LiteralPath $nt -ErrorAction SilentlyContinue) {
@@ -368,11 +383,11 @@ $appPathRoots.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\A
 foreach ($r in $softwareHiveRoots) { $appPathRoots.Add("$r\Software\Microsoft\Windows\CurrentVersion\App Paths") }
 foreach ($apr in $appPathRoots) {
     if (-not (Test-Path $apr -ErrorAction SilentlyContinue)) { continue }
-    Get-ChildItem -Path $apr -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $apr -ErrorAction SilentlyContinue | ForEach-Object {
         $k = $_; $match = ($k.PSChildName -match $PulseRegex)
         if (-not $match) {
             try {
-                $d = (Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue).'(default)'
+                $d = (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue).'(default)'
                 if ($d -and ($d -match $PulseRegex)) { $match = $true }
             } catch {}
         }
@@ -407,12 +422,12 @@ foreach ($c in $classContainers) {
 }
 foreach ($root in $comRoots) {
     if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
-    Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
         $sub = $_; $remove = $false
         if (Test-IsPulseGuid $sub.PSChildName) { $remove = $true }
         else {
             try {
-                $def = (Get-ItemProperty -Path $sub.PSPath -ErrorAction SilentlyContinue).'(default)'
+                $def = (Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).'(default)'
                 if ($def -and ($def -match $PulseRegex)) { $remove = $true }
             } catch {}
         }
@@ -426,7 +441,7 @@ foreach ($root in $comRoots) {
 Section "Removing ProgID classes (Pulse)"
 foreach ($cr in $classContainers) {
     if (-not (Test-Path $cr -ErrorAction SilentlyContinue)) { continue }
-    Get-ChildItem -Path $cr -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $cr -ErrorAction SilentlyContinue |
         Where-Object { $_.PSChildName -match $PulseRegex } | ForEach-Object {
             Invoke-Action "ProgID $($_.PSChildName)" { if (-not (Remove-RegForce $_.PSPath)) { throw "key remained" } }
         }
@@ -439,11 +454,11 @@ $uninstallRoots.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion
 foreach ($r in $softwareHiveRoots) { $uninstallRoots.Add("$r\Software\Microsoft\Windows\CurrentVersion\Uninstall") }
 foreach ($ur in $uninstallRoots) {
     if (-not (Test-Path $ur -ErrorAction SilentlyContinue)) { continue }
-    Get-ChildItem -Path $ur -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $ur -ErrorAction SilentlyContinue | ForEach-Object {
         $key = $_; $remove = (Test-IsPulseGuid $key.PSChildName)
         if (-not $remove) {
             try {
-                $ip = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
+                $ip = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
                 if ("$($ip.DisplayName) $($ip.Publisher) $($ip.InstallLocation) $($ip.UninstallString)" -match $PulseRegex) { $remove = $true }
             } catch {}
         }
@@ -458,7 +473,7 @@ $userRoots = New-Object System.Collections.Generic.List[string]
 $userRoots.Add($env:USERPROFILE)
 try {
     Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
-        $pp = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        $pp = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
         if ($pp -and (Test-Path -LiteralPath $pp -ErrorAction SilentlyContinue)) { $userRoots.Add($pp) }
     }
 } catch {}
@@ -527,19 +542,21 @@ foreach ($tr in ($tempRoots | Select-Object -Unique)) {
 
 Section "Removing the Pulse installer (dropper)"
 foreach ($u in $userRoots) {
-    $dl = Join-Path $u 'Downloads\setup.exe'
-    if (Test-Path -LiteralPath $dl -ErrorAction SilentlyContinue) {
-        $isPulse = $false
-        try {
-            $buf   = [System.IO.File]::ReadAllBytes($dl)
-            $ascii = [System.Text.Encoding]::ASCII.GetString($buf)
-            $uni   = [System.Text.Encoding]::Unicode.GetString($buf)
-            if (($ascii -match 'PulseSoftware|PulseBrowser') -or ($uni -match 'PulseSoftware|PulseBrowser')) { $isPulse = $true }
-        } catch {}
+    $dlDir = Join-Path $u 'Downloads'
+    if (-not (Test-Path -LiteralPath $dlDir -ErrorAction SilentlyContinue)) { continue }
+    Get-ChildItem -LiteralPath $dlDir -Filter *.exe -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $dl = $_.FullName
+        $isPulse = ($_.Name -match $PulseRegex)
+        if (-not $isPulse -and $_.Length -le 67108864) {
+            try {
+                $buf   = [System.IO.File]::ReadAllBytes($dl)
+                $ascii = [System.Text.Encoding]::ASCII.GetString($buf)
+                $uni   = [System.Text.Encoding]::Unicode.GetString($buf)
+                if (($ascii -match 'PulseSoftware|PulseBrowser') -or ($uni -match 'PulseSoftware|PulseBrowser')) { $isPulse = $true }
+            } catch {}
+        }
         if ($isPulse) {
             Invoke-Action "dropper $dl" { if (-not (Remove-PathForce $dl)) { throw 'in use - could not remove' } }
-        } else {
-            Write-Host "    [skip] $dl is not the Pulse installer" -ForegroundColor DarkGray
         }
     }
 }

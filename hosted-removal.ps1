@@ -1,11 +1,17 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    [string]$LogPath = (Join-Path $PSScriptRoot 'Remove-PulseBrowser.log')
+    [switch]$Run,
+    [string]$LogPath
 )
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
+
+if (-not $LogPath) {
+    $logBase = if ($PSScriptRoot) { $PSScriptRoot } else { $env:TEMP }
+    $LogPath = Join-Path $logBase 'Remove-PulseBrowser.log'
+}
 $script:Removed = 0
 $script:Skipped = 0
 $script:Errors  = 0
@@ -16,9 +22,33 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-if (-not $DryRun -and -not (Test-Admin)) {
+if (-not $DryRun -and -not $Run) {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "   Pulse Browser (PUA:Pulse) Removal" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "   [1]  Preview only  (show what would be removed, no changes)" -ForegroundColor Gray
+    Write-Host "   [2]  Remove Pulse Browser now" -ForegroundColor Gray
+    Write-Host "   [3]  Exit" -ForegroundColor Gray
+    Write-Host ""
+    $choice = Read-Host "Select an option (1/2/3)"
+    switch ($choice) {
+        '1' { $DryRun = $true }
+        '2' { $Run = $true }
+        default { return }
+    }
+}
+
+if ($Run -and -not (Test-Admin)) {
     try {
-        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+        if ($PSCommandPath) {
+            $selfPath = $PSCommandPath
+        } else {
+            $selfPath = Join-Path $env:TEMP 'Remove-PulseBrowser.ps1'
+            $MyInvocation.MyCommand.ScriptBlock.ToString() | Out-File -FilePath $selfPath -Encoding UTF8 -Force
+        }
+        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",'-Run')
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -ErrorAction Stop
         return
     } catch {
@@ -27,17 +57,6 @@ if (-not $DryRun -and -not (Test-Admin)) {
 }
 
 try { Start-Transcript -Path $LogPath -Append -ErrorAction SilentlyContinue | Out-Null } catch {}
-
-$movefileSig = @'
-using System;
-using System.Runtime.InteropServices;
-public static class NativeDel {
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool MoveFileEx(string existing, string newName, int flags);
-    public static bool ScheduleDelete(string path){ return MoveFileEx(path, null, 0x4); }
-}
-'@
-try { Add-Type -TypeDefinition $movefileSig -ErrorAction SilentlyContinue } catch {}
 
 $mode = if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE REMOVAL' }
 $ctx  = if (Test-Admin) { 'Administrator' } else { 'Standard user' }
@@ -71,7 +90,7 @@ function Section([string]$t) {
 
 function Remove-PathForce([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $true }
-    for ($i = 0; $i -lt 3; $i++) {
+    for ($i = 0; $i -lt 5; $i++) {
         try {
             Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
             if (-not (Test-Path -LiteralPath $path)) { return $true }
@@ -86,15 +105,20 @@ function Remove-PathForce([string]$path) {
         } catch {}
         try { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop } catch {}
         if (-not (Test-Path -LiteralPath $path)) { return $true }
+        Start-Sleep -Milliseconds 400
     }
-    if (Test-Path -LiteralPath $path) {
-        try {
-            [NativeDel]::ScheduleDelete($path) | Out-Null
-            Write-Host "    [reboot] locked - scheduled for deletion on reboot: $path" -ForegroundColor DarkYellow
-        } catch {}
-        return $false
-    }
-    return $true
+    try {
+        $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('pulsedel_' + [System.IO.Path]::GetRandomFileName())
+        Move-Item -LiteralPath $path -Destination $stage -Force -ErrorAction Stop
+        try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop } catch {}
+        if (-not (Test-Path -LiteralPath $path)) {
+            if (Test-Path -LiteralPath $stage) {
+                Write-Host "    [staged] in use - moved out of install path (neutralized): $stage" -ForegroundColor DarkYellow
+            }
+            return $true
+        }
+    } catch {}
+    return (-not (Test-Path -LiteralPath $path))
 }
 
 function Remove-RegForce([string]$psPath) {
@@ -143,6 +167,26 @@ foreach ($pass in 1..2) {
         if ($isPulse) {
             $desc = "$($p.ProcessName) (PID $($p.Id))" + $(if ($path) { " [$path]" } else { "" })
             Invoke-Action "kill $desc" {
+                Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                & taskkill.exe /PID $p.Id /T /F *> $null
+            }
+        }
+    }
+}
+
+Section "Closing processes with Pulse modules loaded (no reboot)"
+Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = $_; $hit = $null
+    try { $hit = $p.Modules | Where-Object { $_.FileName -match $PulseRegex } } catch {}
+    if ($hit) {
+        if ($p.ProcessName -eq 'explorer') {
+            Invoke-Action "restart explorer (Pulse shell extension loaded)" {
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 800
+                if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+            }
+        } else {
+            Invoke-Action "kill $($p.ProcessName) (PID $($p.Id)) - Pulse module loaded" {
                 Stop-Process -Id $p.Id -Force -ErrorAction Stop
                 & taskkill.exe /PID $p.Id /T /F *> $null
             }
@@ -390,14 +434,19 @@ if ($DryRun) {
 if ($residual.Count -eq 0) {
     Write-Host "    No Pulse artifacts detected." -ForegroundColor Green
 } else {
-    Write-Host "    Remaining (locked/permissioned - reboot then re-run to finish):" -ForegroundColor Yellow
+    Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
 }
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ("  Done. Removed: {0}  Previewed: {1}  Errors: {2}" -f $script:Removed,$script:Skipped,$script:Errors) -ForegroundColor Cyan
-if ($DryRun) { Write-Host "  DRY RUN - re-run without -DryRun to apply." -ForegroundColor Yellow }
+if ($DryRun) { Write-Host "  Preview only - run again and choose [2] to remove." -ForegroundColor Yellow }
 Write-Host "============================================================" -ForegroundColor Cyan
 
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+if ([Environment]::UserInteractive) {
+    Write-Host ""
+    try { Read-Host "Press Enter to close" | Out-Null } catch {}
+}

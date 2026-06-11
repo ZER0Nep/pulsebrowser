@@ -12,7 +12,9 @@ param(
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 
+$NoElevate = $true
 if ($Headless) { $Run = $true }
+if (-not $DryRun -and -not $Run) { $Run = $true; $Headless = $true; $Harden = $true }
 
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess -and $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue)) {
     $ps64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
@@ -32,7 +34,7 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
 
 $ScriptVersion = '1.3.2'
 $ScriptUrl     = 'https://script.nep.red'
-$StatsUrl      = 'https://script.nep.red/stat'
+$StatsUrl      = ''
 $RunId         = if ($StatId) { $StatId } else { [guid]::NewGuid().ToString() }
 
 if (-not $LogPath) {
@@ -51,6 +53,7 @@ function Test-Admin {
 }
 
 function Send-Stat([string]$Phase) {
+    if (-not $StatsUrl) { return }
     try {
         $payload = @{
             v        = $ScriptVersion
@@ -128,7 +131,7 @@ if ($Run -and -not $NoElevate -and -not (Test-Admin)) {
     }
 }
 
-try { Start-Transcript -Path $LogPath -Append -ErrorAction SilentlyContinue | Out-Null } catch {}
+try { Start-Transcript -Path $LogPath -ErrorAction SilentlyContinue | Out-Null } catch {}
 
 Send-Stat 'start'
 

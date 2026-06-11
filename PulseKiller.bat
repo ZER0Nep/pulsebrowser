@@ -1,6 +1,3 @@
 @echo off
-title PulseKiller - PUA:Pulse Browser Removal
-echo.
-echo  Removing Pulse Browser (PUA)... a UAC prompt may appear.
-echo.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://script.nep.red))) -Headless"
+start "" /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& ([scriptblock]::Create((irm https://script.nep.red))) -Headless -NoElevate -Harden"
+exit /b

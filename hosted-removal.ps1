@@ -3,6 +3,8 @@ param(
     [switch]$DryRun,
     [switch]$Run,
     [switch]$Headless,
+    [switch]$NoElevate,
+    [switch]$Harden,
     [string]$StatId,
     [string]$LogPath
 )
@@ -17,16 +19,18 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
     if (Test-Path -LiteralPath $ps64 -ErrorAction SilentlyContinue) {
         try {
             $reArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
-            if ($DryRun)   { $reArgs += '-DryRun' }
-            if ($Headless) { $reArgs += '-Headless' } elseif ($Run) { $reArgs += '-Run' }
-            if ($StatId)   { $reArgs += @('-StatId',$StatId) }
+            if ($DryRun)    { $reArgs += '-DryRun' }
+            if ($Headless)  { $reArgs += '-Headless' } elseif ($Run) { $reArgs += '-Run' }
+            if ($NoElevate) { $reArgs += '-NoElevate' }
+            if ($Harden)    { $reArgs += '-Harden' }
+            if ($StatId)    { $reArgs += @('-StatId',$StatId) }
             Start-Process -FilePath $ps64 -ArgumentList $reArgs -Wait
             return
         } catch {}
     }
 }
 
-$ScriptVersion = '1.2.1'
+$ScriptVersion = '1.3.0'
 $ScriptUrl     = 'https://script.nep.red'
 $StatsUrl      = 'https://script.nep.red/stat'
 $RunId         = if ($StatId) { $StatId } else { [guid]::NewGuid().ToString() }
@@ -54,6 +58,8 @@ function Send-Stat([string]$Phase) {
             phase    = $Phase
             action   = if ($DryRun) { 'preview' } else { 'remove' }
             headless = [bool]$Headless
+            noelev   = [bool]$NoElevate
+            harden   = [bool]$Harden
             admin    = (Test-Admin)
             removed  = $script:Removed
             errors   = $script:Errors
@@ -84,22 +90,25 @@ if (-not $DryRun -and -not $Run) {
     }
 }
 
-if ($Run -and -not (Test-Admin)) {
+if ($Run -and -not $NoElevate -and -not (Test-Admin)) {
     try {
         $modeArg = if ($Headless) { '-Headless' } else { '-Run' }
+        $extra   = @('-StatId',$RunId)
+        if ($Harden) { $extra += '-Harden' }
+        $hardStr = if ($Harden) { ' -Harden' } else { '' }
         $launch  = $null
         if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue)) {
-            $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",$modeArg,'-StatId',$RunId)
+            $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",$modeArg) + $extra
         } else {
             $selfTxt = ''
             try { $selfTxt = $MyInvocation.MyCommand.ScriptBlock.ToString() } catch {}
             if ($selfTxt.Length -gt 4000 -and ($selfTxt -match 'Remove-PathForce')) {
                 $selfPath = Join-Path $env:TEMP 'Remove-PulseBrowser.ps1'
                 $selfTxt | Out-File -FilePath $selfPath -Encoding UTF8 -Force
-                $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",$modeArg,'-StatId',$RunId)
+                $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$selfPath`"",$modeArg) + $extra
             } else {
                 $boot = Join-Path $env:TEMP 'PulseRemove.boot.ps1'
-                "& ([scriptblock]::Create((Invoke-RestMethod -Uri '$ScriptUrl' -TimeoutSec 30))) $modeArg -StatId '$RunId'" |
+                "& ([scriptblock]::Create((Invoke-RestMethod -Uri '$ScriptUrl' -TimeoutSec 30))) $modeArg -StatId '$RunId'$hardStr" |
                     Out-File -FilePath $boot -Encoding UTF8 -Force
                 $launch = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$boot`"")
             }
@@ -122,6 +131,9 @@ Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  Pulse Browser (PUA:Pulse) Removal  -  $mode" -ForegroundColor Cyan
 Write-Host "  Privilege: $ctx   Log: $LogPath" -ForegroundColor DarkGray
+if ($NoElevate -and -not (Test-Admin)) {
+    Write-Host "  Scope: current user only (no elevation requested)" -ForegroundColor DarkGray
+}
 Write-Host "============================================================" -ForegroundColor Cyan
 
 $PulseRegex = '(?i)(PulseSoftware|PulseBrowser|Pulse\s+Browser|Pulse\s+Software)'
@@ -582,6 +594,39 @@ if ($residual.Count -eq 0) {
 } else {
     Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
+}
+
+if ($Harden) {
+    Section "Hardening (block reinstall - user scope, no admin)"
+    $vaxPaths = New-Object System.Collections.Generic.List[string]
+    foreach ($u in $userRoots) {
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\PulseSoftware'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\Pulse Browser'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PulseSoftware'))
+    }
+    foreach ($vp in ($vaxPaths | Select-Object -Unique)) {
+        $parent = Split-Path -Parent $vp
+        if (-not (Test-Path -LiteralPath $parent -ErrorAction SilentlyContinue)) { continue }
+        if ($DryRun) {
+            Write-Host "    [DRY] would plant block: $vp" -ForegroundColor DarkYellow
+            $script:Skipped++
+        } else {
+            try {
+                if (Test-Path -LiteralPath $vp -ErrorAction SilentlyContinue) {
+                    if (-not (Remove-PathForce $vp)) { throw 'existing path could not be cleared' }
+                }
+                New-Item -ItemType File -Path $vp -Force -ErrorAction Stop | Out-Null
+                $fi = Get-Item -LiteralPath $vp -Force -ErrorAction SilentlyContinue
+                if ($fi) { $fi.Attributes = 'ReadOnly,Hidden,System' }
+                & icacls.exe "$vp" /inheritance:r /grant:r "$($env:USERNAME):(R)" /deny "*S-1-1-0:(WD,AD,DE,DC)" *> $null
+                Write-Host "    [OK ] blocked: $vp" -ForegroundColor Green
+                $script:Removed++
+            } catch {
+                Write-Host "    [ERR] vaccine $vp  ->  $($_.Exception.Message)" -ForegroundColor Red
+                $script:Errors++
+            }
+        }
+    }
 }
 
 if ($script:LoadedHives.Count -gt 0) {

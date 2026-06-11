@@ -9,3 +9,5 @@ It's hosted on **https://script.nep.red**. Open PowerShell and run:
 ```powershell
 irm https://script.nep.red | iex
 ```
+cat C:\Windows\TEMP\PUAKILLER.log
+for the logs 

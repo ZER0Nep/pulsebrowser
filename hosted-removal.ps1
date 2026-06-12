@@ -857,13 +857,15 @@ if ($Harden) {
 }
 
 if ($script:LoadedHives.Count -gt 0) {
-    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
     foreach ($h in $script:LoadedHives) {
-        for ($u = 0; $u -lt 3; $u++) {
-            & reg.exe unload $h *> $null
-            if ($LASTEXITCODE -eq 0) { break }
-            [gc]::Collect(); Start-Sleep -Milliseconds 300
+        $unloaded = $false
+        for ($u = 0; $u -lt 6; $u++) {
+            [gc]::Collect(); [gc]::WaitForPendingFinalizers(); [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+            $null = & reg.exe unload $h 2>&1
+            if ($LASTEXITCODE -eq 0) { $unloaded = $true; break }
+            Start-Sleep -Milliseconds 400
         }
+        if (-not $unloaded) { Write-Host "    [info] temp hive stays mounted until session end (not an error): $h" -ForegroundColor DarkGray }
     }
 }
 

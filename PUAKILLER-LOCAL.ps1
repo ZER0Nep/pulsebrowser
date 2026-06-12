@@ -84,11 +84,11 @@ if (-not $DryRun -and -not $Run) {
     if (-not [Environment]::UserInteractive) { return }
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "   Pulse Browser (PUA:Pulse) Removal" -ForegroundColor Cyan
+    Write-Host "   PUA Removal  -  Pulse / OpenBook / ConvertMate / PDFEditor" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "   [1]  Preview only  (show what would be removed, no changes)" -ForegroundColor Gray
-    Write-Host "   [2]  Remove Pulse Browser now" -ForegroundColor Gray
+    Write-Host "   [2]  Remove now" -ForegroundColor Gray
     Write-Host "   [3]  Exit" -ForegroundColor Gray
     Write-Host ""
     $choice = $null
@@ -139,7 +139,7 @@ $mode = if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE REMOVAL' }
 $ctx  = if (Test-Admin) { 'Administrator' } else { 'Standard user' }
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Pulse Browser (PUA:Pulse) Removal  -  $mode" -ForegroundColor Cyan
+Write-Host "  PUA Removal (Pulse / OpenBook / ConvertMate / PDFEditor)  -  $mode" -ForegroundColor Cyan
 Write-Host "  Privilege: $ctx   Log: $LogPath" -ForegroundColor DarkGray
 if ($NoElevate -and -not (Test-Admin)) {
     Write-Host "  Scope: current user only (no elevation requested)" -ForegroundColor DarkGray
@@ -161,6 +161,20 @@ $PulseGuids = @(
 function Test-IsPulseGuid([string]$s) {
     if (-not $s) { return $false }
     return $PulseGuids -contains ($s.Trim('{','}').ToUpper())
+}
+
+function Get-RegSubKeys([string]$path) {
+    try {
+        $base = $null; $sub = ''
+        if     ($path -match '^HKLM:\\(.+)$')                       { $base = [Microsoft.Win32.Registry]::LocalMachine; $sub = $Matches[1] }
+        elseif ($path -match '^HKCU:\\(.+)$')                       { $base = [Microsoft.Win32.Registry]::CurrentUser;  $sub = $Matches[1] }
+        elseif ($path -match '(?:Registry::)?HKEY_USERS\\(.+)$')         { $base = [Microsoft.Win32.Registry]::Users;        $sub = $Matches[1] }
+        elseif ($path -match '(?:Registry::)?HKEY_LOCAL_MACHINE\\(.+)$') { $base = [Microsoft.Win32.Registry]::LocalMachine; $sub = $Matches[1] }
+        if (-not $base) { return @() }
+        $k = $base.OpenSubKey($sub)
+        if (-not $k) { return @() }
+        $n = $k.GetSubKeyNames(); $k.Close(); return $n
+    } catch { return @() }
 }
 
 function Section([string]$t) {
@@ -238,6 +252,168 @@ function Invoke-Action {
     }
 }
 
+function Invoke-PuaSweep {
+    param([string]$Name,[string]$Rx,[string[]]$Proc,[string[]]$Dirs,[string]$Pub = '',[bool]$Nw = $false)
+
+    Section "Removing $Name (PUA) - processes"
+    $sweepPasses = if ($DryRun) { 1 } else { 2 }
+    foreach ($pass in 1..$sweepPasses) {
+        Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = $_; $path = $null
+            try { $path = $p.Path } catch {}
+            $hit = $false
+            if ($Proc -contains $p.ProcessName) { $hit = $true }
+            elseif ($path -and ($path -match $Rx)) { $hit = $true }
+            if ($hit) {
+                $desc = "$($p.ProcessName) (PID $($p.Id))" + $(if ($path) { " [$path]" } else { "" })
+                Invoke-Action "kill $desc" {
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                    & taskkill.exe /PID $p.Id /T /F *> $null
+                    if (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) { throw 'still running' }
+                }
+            }
+        }
+    }
+
+    Section "Removing $Name (PUA) - scheduled tasks"
+    if ($hasSchedCmd) {
+        Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+            $t = $_; $hay = @($t.TaskName,$t.TaskPath)
+            try { $hay += ($t.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) } catch {}
+            if (($hay -join ' ') -match $Rx) {
+                Invoke-Action "task $($t.TaskPath)$($t.TaskName)" {
+                    Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+                }
+            }
+        }
+    }
+    & schtasks.exe /Query /FO CSV /NH 2>$null | ForEach-Object {
+        if ($_ -match $Rx) {
+            $tn = ($_ -split '","')[0].Trim('"')
+            if ($tn) { Invoke-Action "task(schtasks) $tn" { & schtasks.exe /Delete /TN "$tn" /F *> $null; if ($LASTEXITCODE -ne 0) { throw "schtasks delete failed ($LASTEXITCODE)" } } }
+        }
+    }
+
+    Section "Removing $Name (PUA) - services"
+    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
+        $svc = $_
+        if ("$($svc.Name) $($svc.DisplayName) $($svc.PathName)" -match $Rx) {
+            Invoke-Action "service $($svc.Name) [$($svc.DisplayName)]" {
+                if ($svc.State -ne 'Stopped') { Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue; & taskkill.exe /F /FI "SERVICES eq $($svc.Name)" *> $null }
+                & sc.exe config $svc.Name start= disabled *> $null
+                & sc.exe delete $svc.Name *> $null
+                if ($LASTEXITCODE -ne 0 -and (Get-Service -Name $svc.Name -ErrorAction SilentlyContinue)) { throw "sc delete failed ($LASTEXITCODE)" }
+            }
+        }
+    }
+
+    Section "Removing $Name (PUA) - autostart / app paths / classes"
+    $rkList = New-Object System.Collections.Generic.List[string]
+    foreach ($b in @('HKLM:\Software\Microsoft\Windows\CurrentVersion','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion')) { $rkList.Add("$b\Run"); $rkList.Add("$b\RunOnce") }
+    foreach ($r in $softwareHiveRoots) { $rkList.Add("$r\Software\Microsoft\Windows\CurrentVersion\Run"); $rkList.Add("$r\Software\Microsoft\Windows\CurrentVersion\RunOnce") }
+    foreach ($rk in $rkList) {
+        if (-not (Test-Path $rk -ErrorAction SilentlyContinue)) { continue }
+        $props = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+        foreach ($p in $props.PSObject.Properties) {
+            if ($p.Name -like 'PS*') { continue }
+            if (("$($p.Name) $($p.Value)") -match $Rx) {
+                Invoke-Action "Run value $rk\$($p.Name)" { Remove-ItemProperty -Path $rk -Name $p.Name -Force -ErrorAction Stop }
+            }
+        }
+    }
+    $apList = New-Object System.Collections.Generic.List[string]
+    $apList.Add('HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths')
+    $apList.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths')
+    foreach ($r in $softwareHiveRoots) { $apList.Add("$r\Software\Microsoft\Windows\CurrentVersion\App Paths") }
+    foreach ($apr in $apList) {
+        if (-not (Test-Path $apr -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $apr -ErrorAction SilentlyContinue | ForEach-Object {
+            $k = $_; $m = ($k.PSChildName -match $Rx)
+            if (-not $m) { try { $d = (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue).'(default)'; if ($d -and ($d -match $Rx)) { $m = $true } } catch {} }
+            if ($m) { Invoke-Action "AppPath $($k.PSChildName)" { if (-not (Remove-RegForce $k.PSPath)) { throw 'key remained' } } }
+        }
+    }
+    foreach ($cr in $classContainers) {
+        foreach ($nm in (Get-RegSubKeys $cr)) {
+            if ($nm -match $Rx) { $kp = "$cr\$nm"; Invoke-Action "class $nm" { if (-not (Remove-RegForce $kp)) { throw 'key remained' } } }
+        }
+    }
+
+    Section "Removing $Name (PUA) - uninstall entries"
+    $unList = New-Object System.Collections.Generic.List[string]
+    $unList.Add('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+    $unList.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
+    foreach ($r in $softwareHiveRoots) { $unList.Add("$r\Software\Microsoft\Windows\CurrentVersion\Uninstall") }
+    foreach ($ur in $unList) {
+        if (-not (Test-Path $ur -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $ur -ErrorAction SilentlyContinue | ForEach-Object {
+            $key = $_; $remove = ($key.PSChildName -match $Rx)
+            if (-not $remove) {
+                try {
+                    $ip = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+                    if ("$($ip.DisplayName) $($ip.InstallLocation) $($ip.UninstallString) $($ip.DisplayIcon)" -match $Rx) { $remove = $true }
+                    elseif ($Pub -and $ip.Publisher -and ($ip.Publisher -match $Pub)) { $remove = $true }
+                } catch {}
+            }
+            if ($remove) { Invoke-Action "Uninstall key $($key.PSChildName)" { if (-not (Remove-RegForce $key.PSPath)) { throw 'key remained' } } }
+        }
+    }
+
+    Section "Removing $Name (PUA) - files, shortcuts, temp, dropper"
+    foreach ($d in ($Dirs | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $d -ErrorAction SilentlyContinue) {
+            Invoke-Action "dir $d" { if (-not (Remove-PathForce $d)) { throw 'in use - could not fully remove' } }
+        }
+    }
+    $lnkRoots = @()
+    foreach ($u in $userRoots) {
+        $lnkRoots += (Join-Path $u 'Desktop')
+        $lnkRoots += (Join-Path $u 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs')
+        $lnkRoots += (Join-Path $u 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch')
+    }
+    $lnkRoots += (Join-Path $env:Public 'Desktop')
+    if ($env:ProgramData) { $lnkRoots += (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs') }
+    foreach ($root in ($lnkRoots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $root -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $root -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+            $lnk = $_; $is = ($lnk.Name -match $Rx)
+            if (-not $is) { try { $sc = $wsh.CreateShortcut($lnk.FullName); if (("$($sc.TargetPath) $($sc.Arguments) $($sc.WorkingDirectory)") -match $Rx) { $is = $true } } catch {} }
+            if ($is) { Invoke-Action "shortcut $($lnk.FullName)" { if (-not (Remove-PathForce $lnk.FullName)) { throw 'in use - could not remove' } } }
+        }
+    }
+    foreach ($u in $userRoots) {
+        $dl = Join-Path $u 'Downloads'
+        if (-not (Test-Path -LiteralPath $dl -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $dl -Filter *.exe -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Rx } | ForEach-Object {
+            Invoke-Action "dropper $($_.FullName)" { if (-not (Remove-PathForce $_.FullName)) { throw 'in use - could not remove' } }
+        }
+    }
+    $tmpRoots = @($env:TEMP)
+    foreach ($u in $userRoots) { $tmpRoots += (Join-Path $u 'AppData\Local\Temp') }
+    foreach ($tr in ($tmpRoots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $tr -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $tr -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Rx } | ForEach-Object {
+            Invoke-Action "temp $($_.FullName)" { if (-not (Remove-PathForce $_.FullName)) { throw 'in use - could not remove' } }
+        }
+        if ($Nw) {
+            Get-ChildItem -LiteralPath $tr -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^nw[0-9]' } | ForEach-Object {
+                $nwDir = $_.FullName; $match = $false
+                foreach ($mf in @('package.json','package.nw','manifest.json')) {
+                    $mp = Join-Path $nwDir $mf
+                    if (Test-Path -LiteralPath $mp -ErrorAction SilentlyContinue) {
+                        try { if (([System.IO.File]::ReadAllText($mp)) -match $Rx) { $match = $true; break } } catch {}
+                    }
+                }
+                if (-not $match) {
+                    try { if (Get-ChildItem -LiteralPath $nwDir -Filter *.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Rx }) { $match = $true } } catch {}
+                }
+                if ($match) { Invoke-Action "temp(nw) $nwDir" { if (-not (Remove-PathForce $nwDir)) { throw 'in use - could not remove' } } }
+            }
+        }
+    }
+}
+
 $hasSchedCmd = [bool](Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)
 
 Section "Stopping Pulse processes"
@@ -264,9 +440,8 @@ foreach ($pass in 1..$passes) {
 }
 
 Section "Closing other processes with Pulse modules loaded (no reboot)"
-Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+Get-Process -Name explorer,dllhost,rundll32 -ErrorAction SilentlyContinue | ForEach-Object {
     $p = $_
-    if ($procNames -contains $p.ProcessName) { return }
     $hit = $null
     try { $hit = $p.Modules | Where-Object { $_.FileName -match $PulseRegex } } catch {}
     if ($hit) {
@@ -438,37 +613,42 @@ foreach ($k in $vendorKeys) {
 }
 
 Section "Removing COM / AppID / TypeLib / Interface registrations (Pulse only)"
-$comRoots = New-Object System.Collections.Generic.List[string]
 foreach ($c in $classContainers) {
-    foreach ($leaf in @('CLSID','AppID','TypeLib','Interface','Wow6432Node\CLSID','Wow6432Node\AppID','Wow6432Node\TypeLib','Wow6432Node\Interface')) {
-        $comRoots.Add("$c\$leaf")
-    }
-}
-foreach ($root in $comRoots) {
-    if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue }
-    Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
-        $sub = $_; $remove = $false
-        if (Test-IsPulseGuid $sub.PSChildName) { $remove = $true }
-        else {
-            try {
-                $def = (Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).'(default)'
-                if ($def -and ($def -match $PulseRegex)) { $remove = $true }
-            } catch {}
+    foreach ($leaf in @('CLSID','AppID','Interface','Wow6432Node\CLSID','Wow6432Node\AppID','Wow6432Node\Interface')) {
+        $root = "$c\$leaf"
+        foreach ($g in $PulseGuids) {
+            $kp = "$root\{$g}"
+            if (Test-Path -LiteralPath $kp -ErrorAction SilentlyContinue) {
+                Invoke-Action "COM $kp" { if (-not (Remove-RegForce $kp)) { throw "key remained" } }
+            }
         }
-        if ($remove) {
-            $disp = $sub.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::',''
-            Invoke-Action "COM $disp" { if (-not (Remove-RegForce $sub.PSPath)) { throw "key remained" } }
+    }
+    foreach ($tl in @("$c\TypeLib","$c\Wow6432Node\TypeLib")) {
+        if (-not (Test-Path $tl -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $tl -ErrorAction SilentlyContinue | ForEach-Object {
+            $sub = $_; $remove = (Test-IsPulseGuid $sub.PSChildName)
+            if (-not $remove) {
+                try {
+                    $def = (Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue).'(default)'
+                    if ($def -and ($def -match $PulseRegex)) { $remove = $true }
+                } catch {}
+            }
+            if ($remove) {
+                $disp = $sub.PSPath -replace '^Microsoft\.PowerShell\.Core\\Registry::',''
+                Invoke-Action "TypeLib $disp" { if (-not (Remove-RegForce $sub.PSPath)) { throw "key remained" } }
+            }
         }
     }
 }
 
 Section "Removing ProgID classes (Pulse)"
 foreach ($cr in $classContainers) {
-    if (-not (Test-Path $cr -ErrorAction SilentlyContinue)) { continue }
-    Get-ChildItem -LiteralPath $cr -ErrorAction SilentlyContinue |
-        Where-Object { $_.PSChildName -match $PulseRegex } | ForEach-Object {
-            Invoke-Action "ProgID $($_.PSChildName)" { if (-not (Remove-RegForce $_.PSPath)) { throw "key remained" } }
+    foreach ($name in (Get-RegSubKeys $cr)) {
+        if ($name -match $PulseRegex) {
+            $kp = "$cr\$name"
+            Invoke-Action "ProgID $name" { if (-not (Remove-RegForce $kp)) { throw "key remained" } }
         }
+    }
 }
 
 Section "Removing Add/Remove Programs (Uninstall) entries"
@@ -585,6 +765,26 @@ foreach ($u in $userRoots) {
     }
 }
 
+$extraPuas = @(
+    @{ Name='OpenBook';    Rx='(?i)\bOpenBook\b';    Proc=@('OpenBook');    Pub='';                       Nw=$true  },
+    @{ Name='ConvertMate'; Rx='(?i)\bConvertMate\b'; Proc=@('ConvertMate'); Pub='(?i)Amaryllis';           Nw=$false },
+    @{ Name='PDFEditor';   Rx='(?i)\bPDFEditor\b';   Proc=@('PDFEditor');   Pub='(?i)(AppSuite|Eclipse Media)'; Nw=$false }
+)
+foreach ($pua in $extraPuas) {
+    $pd = New-Object System.Collections.Generic.List[string]
+    foreach ($u in $userRoots) {
+        $pd.Add((Join-Path $u "AppData\Local\$($pua.Name)"))
+        $pd.Add((Join-Path $u "AppData\Roaming\$($pua.Name)"))
+        $pd.Add((Join-Path $u "AppData\Local\Programs\$($pua.Name)"))
+        $pd.Add((Join-Path $u "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\$($pua.Name)"))
+    }
+    if ($env:ProgramFiles)        { $pd.Add((Join-Path $env:ProgramFiles $pua.Name)) }
+    if (${env:ProgramFiles(x86)}) { $pd.Add((Join-Path ${env:ProgramFiles(x86)} $pua.Name)) }
+    if ($env:ProgramData)         { $pd.Add((Join-Path $env:ProgramData $pua.Name)); $pd.Add((Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\$($pua.Name)")) }
+    $pua.Dirs = $pd
+    Invoke-PuaSweep -Name $pua.Name -Rx $pua.Rx -Proc $pua.Proc -Dirs $pua.Dirs -Pub $pua.Pub -Nw $pua.Nw
+}
+
 Section "Verification"
 $residual = @()
 foreach ($k in $vendorKeys) { if (Test-Path $k -ErrorAction SilentlyContinue) { $residual += "reg: $k" } }
@@ -598,11 +798,23 @@ Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
     Where-Object { "$($_.Name) $($_.DisplayName) $($_.PathName)" -match $PulseRegex } |
     ForEach-Object { $residual += "svc: $($_.Name)" }
 
+foreach ($pua in $extraPuas) {
+    foreach ($d in ($pua.Dirs | Select-Object -Unique)) { if (Test-Path -LiteralPath $d -ErrorAction SilentlyContinue) { $residual += "dir: $d" } }
+    if ($hasSchedCmd) {
+        Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object { (($_.TaskName + $_.TaskPath) -match $pua.Rx) } |
+            ForEach-Object { $residual += "task: $($_.TaskPath)$($_.TaskName)" }
+    }
+    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { "$($_.Name) $($_.DisplayName) $($_.PathName)" -match $pua.Rx } |
+        ForEach-Object { $residual += "svc: $($_.Name)" }
+}
+
 if ($DryRun) {
     Write-Host "    (DryRun) reflects current state, not post-removal." -ForegroundColor DarkYellow
 }
 if ($residual.Count -eq 0) {
-    Write-Host "    No Pulse artifacts detected." -ForegroundColor Green
+    Write-Host "    No PUA artifacts detected (Pulse / OpenBook / ConvertMate / PDFEditor)." -ForegroundColor Green
 } else {
     Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
@@ -615,6 +827,12 @@ if ($Harden) {
         $vaxPaths.Add((Join-Path $u 'AppData\Local\PulseSoftware'))
         $vaxPaths.Add((Join-Path $u 'AppData\Local\Pulse Browser'))
         $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PulseSoftware'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\OpenBook'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\OpenBook'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\ConvertMate'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\PDFEditor'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PDFEditor'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\PDFEditor'))
     }
     foreach ($vp in ($vaxPaths | Select-Object -Unique)) {
         $parent = Split-Path -Parent $vp

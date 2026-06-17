@@ -81,7 +81,7 @@ if (-not $DryRun -and -not $Run) {
     if (-not [Environment]::UserInteractive) { return }
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "   PUA Removal  -  Pulse / OpenBook / ConvertMate / PDFEditor" -ForegroundColor Cyan
+    Write-Host "   PUA Removal  -  Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser / OneStart / ManualFinder" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "   [1]  Preview only  (show what would be removed, no changes)" -ForegroundColor Gray
@@ -136,7 +136,7 @@ $mode = if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE REMOVAL' }
 $ctx  = if (Test-Admin) { 'Administrator' } else { 'Standard user' }
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  PUA Removal (Pulse / OpenBook / ConvertMate / PDFEditor)  -  $mode" -ForegroundColor Cyan
+Write-Host "  PUA Removal (Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser / OneStart / ManualFinder)  -  $mode" -ForegroundColor Cyan
 Write-Host "  Privilege: $ctx   Log: $LogPath" -ForegroundColor DarkGray
 if ($NoElevate -and -not (Test-Admin)) {
     Write-Host "  Scope: current user only (no elevation requested)" -ForegroundColor DarkGray
@@ -777,7 +777,36 @@ $extraPuas = @(
     # Name='EPISoftware' so the folder sweep removes the whole vendor tree (EpiBrowser + Application + Update). The broad Rx
     # catches EpiBrowser/EpiStart artifacts (tasks, run-values, shortcuts) regardless of folder; notification_helper.exe is
     # killed via path-match (under EPISoftware) rather than by generic process name to avoid touching other Chromium browsers.
-    @{ Name='EPISoftware'; Rx='(?i)(EPISoftware|EpiBrowser|Epi\s+Browser|EpiStart)'; Proc=@('epibrowser','setup.epibrowser'); Pub='(?i)(EPISoftware|EPI\s*Software)'; Nw=$false }
+    @{ Name='EPISoftware'; Rx='(?i)(EPISoftware|EpiBrowser|Epi\s+Browser|EpiStart)'; Proc=@('epibrowser','setup.epibrowser'); Pub='(?i)(EPISoftware|EPI\s*Software)'; Nw=$false },
+    # OneStart / OneStart.ai - "AI browser" Chromium-clone PUA (browser hijacker/adware), TamperedChef/AppSuite/BaoLoader
+    # cluster (Unit42 CL-CRI-1089; same operators as EpiBrowser per Sophos/Truesec; shares C2 mka3e8.com). Spread via
+    # malvertising for free PDF tools. Signers: OneStart Technologies LLC / Caerus Media LLC / Apollo Technologies Inc (SSL.com).
+    # Verified: pcrisk.com/removal-guides/30436, todyl.com/blog/onestart-ai-browser-deception, any.run, file.net, advanceduninstaller.com.
+    # Install: %LOCALAPPDATA%\OneStart.ai\OneStart\{Application\<ver>,User Data}; also %APPDATA%\OneStart. Process onestart.exe.
+    # Reg: HKCU\Software\OneStart.ai; uninstall "OneStart.ai OneStart" + GUID {31F4B209-D4E1-41E0-A34F-35EFF7117AE8};
+    # StartMenuInternet\OneStart.6GNARUVKKH5IO36LFVEZWHOWXE. Run: OneStartChromium/OneStartBar/OneStartUpdate. Tasks:
+    # "OneStart Chromium/Updater/Maintenance/Cleanup" + randomized "sys_component_health_*" Node.js tasks. Toolbar: OneStartBar/DBar.
+    # Verified full SHA256: installer fb64aad28d17cf4ccae7297e85223674f43d583accc389dafb27947870f86cfd,
+    #                       app       246e8d6a45c989f0ae56d1145a2091c5677c6c8d476b733ed275957782f7c9c0,
+    #                       MSI       d2690d69627089f97e49461c55f195441ee6279f9b6ffa246c9fc4ae3e4c392a (any.run).
+    # Two entries: 'OneStart.ai' removes the Local vendor tree; 'OneStart' catches %APPDATA%\OneStart + Programs/Start-Menu folders.
+    # Rx '(?i)OneStart' covers OneStart.ai/OneStartBar/OneStartChromium/OneStartUpdate; generic Chromium helpers
+    # (notification_helper/chrome_proxy) are killed by path-match, NOT by name, to avoid touching legit browsers.
+    @{ Name='OneStart.ai'; Rx='(?i)OneStart'; Proc=@('onestart'); Pub='(?i)(OneStart\.ai|OneStart Technologies|Caerus Media)'; Nw=$false },
+    @{ Name='OneStart';    Rx='(?i)\bOneStart\b'; Proc=@(); Pub=''; Nw=$false },
+    # ManualFinder / ManualFinderApp / AllManualsFinder - trojanized "find product manuals" installer; TamperedChef / AppSuite /
+    # BaoLoader cluster, SAME operators as OneStart (G DATA/Expel/Sophos; shared C2 mka3e8.com, portal.manualfinder.app).
+    # NOT mere adware: infostealer/loader (Chromium cred+cookie theft, residential proxy) - treat a hit as a COMPROMISE IOC.
+    # ManualFinderApp.exe signed by "GLINT SOFTWARE SDN. BHD." (revoked). Detections: Sophos Mal/Isher-Gen / Troj/EvilAI-H,
+    # MS Trojan:Win64/InfoStealer!MSR. Install: %LOCALAPPDATA%\{ManualFinder, Programs\ManualFinder}; silent msiexec /qn /i
+    # ...\Temp\ManualFinder-v2.0.196.msi; persistence = scheduled task -> node.exe runs a GUID .js in %TEMP%. Siblings under
+    # %LOCALAPPDATA%\Programs\: AllManualsReader/OpenMyManual/ManualReaderPro/TotalUserManuals (caught by Rx).
+    # Verified: expel.com/.../you-dont-find-manualfinder..., sophos.com, gdatasoftware.com, lindensec.com, any.run, hybrid-analysis.
+    # Verified full SHA256: ManualFinderApp.exe        71edb9f9f757616fe62a49f2d5b55441f91618904517337abd9d0725b07c2a51,
+    #                       ManualFinder-v2.0.196.msi  ed797beb927738d68378cd718ea0dc74e605df0e66bd5670f557217720fb2871.
+    # Name='ManualFinder' sweeps Local + Roaming + Programs\ManualFinder. Generic loader processes (node/msiexec/mshta/
+    # powershell/cmd/svchost) are deliberately NOT in Proc - they are OS/legit; the malicious node.exe is caught by path-Rx.
+    @{ Name='ManualFinder'; Rx='(?i)(manualfinder|allmanualsfinder|allmanualsreader|openmymanual|manualreaderpro|totalusermanuals|pdfeditorupdater)'; Proc=@('ManualFinderApp','AllManualsReader','OpenMyManual','ManualReaderPro','TotalUserManuals'); Pub='(?i)(GLINT SOFTWARE SDN\.? BHD|GLINT By J SDN\.? BHD|ECHO\s*INFINI SDN\.? BHD|SUMMIT NEXUS Holdings)'; Nw=$false }
 )
 foreach ($pua in $extraPuas) {
     $pd = New-Object System.Collections.Generic.List[string]
@@ -823,7 +852,7 @@ if ($DryRun) {
     Write-Host "    (DryRun) reflects current state, not post-removal." -ForegroundColor DarkYellow
 }
 if ($residual.Count -eq 0) {
-    Write-Host "    No PUA artifacts detected (Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser)." -ForegroundColor Green
+    Write-Host "    No PUA artifacts detected (Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser / OneStart / ManualFinder)." -ForegroundColor Green
 } else {
     Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
@@ -845,6 +874,12 @@ if ($Harden) {
         $vaxPaths.Add((Join-Path $u 'AppData\Local\EPISoftware'))
         $vaxPaths.Add((Join-Path $u 'AppData\Roaming\EPISoftware'))
         $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\EPISoftware'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\OneStart.ai'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\OneStart'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\OneStart.ai'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\ManualFinder'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\ManualFinder'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\ManualFinder'))
     }
     foreach ($vp in ($vaxPaths | Select-Object -Unique)) {
         $parent = Split-Path -Parent $vp

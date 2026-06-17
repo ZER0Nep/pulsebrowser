@@ -5,6 +5,7 @@ param(
     [switch]$Headless,
     [switch]$NoElevate,
     [switch]$Harden,
+    [switch]$SkipCertScan,
     [string]$StatId,
     [string]$LogPath
 )
@@ -77,11 +78,83 @@ function Send-Stat([string]$Phase) {
     } catch {}
 }
 
+# ============================================================================
+#  PUA REGISTRY  --  TO ADD A NEW PUA, ADD ONE ENTRY TO $Puas BELOW. Nothing
+#  else needs editing: the sweep, the on-screen banner, the -Harden reinstall
+#  blockers and the final verification list are all derived from this list.
+#
+#  Fields:
+#    Name   = top-level install-folder name. The folder sweep deletes
+#             %LOCALAPPDATA%\<Name>, %APPDATA%\<Name>, ...\Programs\<Name>,
+#             Start-Menu\<Name>, %ProgramFiles%\<Name>, %ProgramData%\<Name>.
+#    Label  = display name in the banner/verification ('' = hide it, e.g. a
+#             second helper entry for the same product).
+#    Rx     = case-insensitive regex matched against process paths, Run
+#             values+data, App Paths, COM classes, uninstall entries, tasks,
+#             shortcuts, droppers and Temp items.
+#    Proc   = exact process names to kill (WITHOUT .exe). Use ONLY distinctive
+#             names - never generic ones (node, msiexec, chrome, ...); those are
+#             caught by path via Rx so legitimate apps are never touched.
+#    Pub    = optional publisher regex for Add/Remove-Programs entries.
+#    Nw     = $true to also clean NW.js (nw*) Temp dirs whose manifest matches.
+#    Harden = AppData-relative folders to seal against reinstall under -Harden
+#             (e.g. 'Local\Foo','Roaming\Foo','Local\Programs\Foo').
+# ============================================================================
+$Puas = @(
+    @{ Name='OpenBook';    Label='OpenBook';    Rx='(?i)\bOpenBook\b';    Proc=@('OpenBook');    Pub='';                            Nw=$true;  Harden=@('Local\OpenBook','Roaming\OpenBook') },
+    @{ Name='ConvertMate'; Label='ConvertMate'; Rx='(?i)\bConvertMate\b'; Proc=@('ConvertMate'); Pub='(?i)Amaryllis';                Nw=$false; Harden=@('Local\ConvertMate') },
+    @{ Name='PDFEditor';   Label='PDFEditor';   Rx='(?i)\bPDFEditor\b';   Proc=@('PDFEditor');   Pub='(?i)(AppSuite|Eclipse Media)'; Nw=$false; Harden=@('Local\PDFEditor','Roaming\PDFEditor','Local\Programs\PDFEditor') },
+
+    # EpiBrowser / EpiStart - Chromium-clone PUA. Vendor folder %LOCALAPPDATA%\EPISoftware (all-caps EPI); abused cert
+    # "Byte Media Sdn. Bhd." (TamperedChef cluster). Verified: todyl.com/blog/epibrowser, pcrisk #32056, file.net, any.run.
+    # Detections: Malwarebytes PUP.Optional.EpiBrowser, Sophos "Epi Browser (PUA)". Install: EPISoftware\EpiBrowser\Application\<ver>\
+    # (epibrowser.exe, notification_helper.exe); stager Temp\epibrowser-bin. Reg: HKCU\Software\EPISoftware\{EpiBrowser*,Update*}.
+    # Tasks: EpiBrowserUpdate, EpiBrowserStartup. Full SHA256: installer 06b89c8a..c2044, app 2fe2d16e..f88e31.
+    # notification_helper.exe is killed by path-match (under EPISoftware), not by generic name.
+    @{ Name='EPISoftware'; Label='EpiBrowser'; Rx='(?i)(EPISoftware|EpiBrowser|Epi\s+Browser|EpiStart)'; Proc=@('epibrowser','setup.epibrowser'); Pub='(?i)(EPISoftware|EPI\s*Software)'; Nw=$false; Harden=@('Local\EPISoftware','Roaming\EPISoftware','Local\Programs\EPISoftware') },
+
+    # OneStart / OneStart.ai - "AI browser" Chromium-clone hijacker; TamperedChef/AppSuite/BaoLoader cluster, same operators as
+    # EpiBrowser (Sophos/Truesec; shared C2 mka3e8.com). Signers: OneStart Technologies / Caerus Media / Apollo Technologies (SSL.com).
+    # Verified: pcrisk #30436, todyl.com/blog/onestart-ai-browser-deception, any.run, file.net, advanceduninstaller.com.
+    # Install: %LOCALAPPDATA%\OneStart.ai\OneStart\{Application\<ver>,User Data}; also %APPDATA%\OneStart. Process onestart.exe.
+    # Reg: HKCU\Software\OneStart.ai; uninstall GUID {31F4B209-D4E1-41E0-A34F-35EFF7117AE8}. Run: OneStartChromium/OneStartBar.
+    # Tasks: "OneStart Chromium/Updater/Maintenance/Cleanup" + randomized sys_component_health_* Node tasks. Toolbar OneStartBar/DBar.
+    # Full SHA256: installer fb64aad2..f86cfd, app 246e8d6a..f7c9c0, MSI d2690d69..4c392a (any.run). Two entries: 'OneStart.ai'
+    # clears the Local vendor tree; 'OneStart' (Label hidden) catches %APPDATA%\OneStart + Programs/Start-Menu folders.
+    @{ Name='OneStart.ai'; Label='OneStart'; Rx='(?i)OneStart'; Proc=@('onestart'); Pub='(?i)(OneStart\.ai|OneStart Technologies|Caerus Media)'; Nw=$false; Harden=@('Local\OneStart.ai','Roaming\OneStart','Local\Programs\OneStart.ai') },
+    @{ Name='OneStart';    Label='';         Rx='(?i)\bOneStart\b'; Proc=@(); Pub=''; Nw=$false; Harden=@() },
+
+    # ManualFinder / ManualFinderApp / AllManualsFinder - trojanized "find product manuals" installer; TamperedChef/AppSuite/BaoLoader,
+    # SAME operators as OneStart (G DATA/Expel/Sophos; shared C2 mka3e8.com). NOT mere adware: infostealer/loader (Chromium cred+cookie
+    # theft, residential proxy) - treat a hit as a COMPROMISE IOC. ManualFinderApp.exe signed by "GLINT SOFTWARE SDN. BHD." (revoked).
+    # Detections: Sophos Mal/Isher-Gen / Troj/EvilAI-H, MS Trojan:Win64/InfoStealer!MSR. Install: %LOCALAPPDATA%\{ManualFinder,
+    # Programs\ManualFinder}; persistence = scheduled task -> node.exe runs a GUID .js in %TEMP%. Siblings under Programs\:
+    # AllManualsReader/OpenMyManual/ManualReaderPro/TotalUserManuals (caught by Rx). Full SHA256: app 71edb9f9..c2a51, MSI ed797beb..b2871.
+    # Generic loader processes (node/msiexec/mshta/powershell/cmd/svchost) are NOT in Proc - OS/legit; malicious node.exe caught by path-Rx.
+    @{ Name='ManualFinder'; Label='ManualFinder'; Rx='(?i)(manualfinder|allmanualsfinder|allmanualsreader|openmymanual|manualreaderpro|totalusermanuals|pdfeditorupdater)'; Proc=@('ManualFinderApp','AllManualsReader','OpenMyManual','ManualReaderPro','TotalUserManuals'); Pub='(?i)(GLINT SOFTWARE SDN\.? BHD|GLINT By J SDN\.? BHD|ECHO\s*INFINI SDN\.? BHD|SUMMIT NEXUS Holdings)'; Nw=$false; Harden=@('Local\ManualFinder','Local\Programs\ManualFinder','Roaming\ManualFinder') }
+)
+$puaBanner = 'Pulse / ' + (($Puas | ForEach-Object { $_.Label } | Where-Object { $_ }) -join ' / ')
+
+# Code-signing publishers abused (almost) exclusively by this PUA cluster (TamperedChef / BaoLoader / AppSuite). Deliberately
+# limited to DISTINCTIVE shell-company subjects so a signer match is safe to act on; the cluster's more generically named
+# US-shell certs are covered by name/path via $Puas instead, to avoid false positives against legitimately-named vendors.
+$BadSigners = @(
+    'GLINT SOFTWARE SDN',
+    'GLINT By J SDN',
+    'ECHO INFINI SDN',
+    'SUMMIT NEXUS Holdings',
+    'Byte Media Sdn',
+    'OneStart Technologies',
+    'Caerus Media',
+    'VAST LAKE'
+)
+$BadSignerRx = '(?i)(' + (($BadSigners | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')'
+
 if (-not $DryRun -and -not $Run) {
     if (-not [Environment]::UserInteractive) { return }
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "   PUA Removal  -  Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser / OneStart / ManualFinder" -ForegroundColor Cyan
+    Write-Host "   PUA Removal  -  $puaBanner" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "   [1]  Preview only  (show what would be removed, no changes)" -ForegroundColor Gray
@@ -136,7 +209,7 @@ $mode = if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE REMOVAL' }
 $ctx  = if (Test-Admin) { 'Administrator' } else { 'Standard user' }
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  PUA Removal (Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser / OneStart / ManualFinder)  -  $mode" -ForegroundColor Cyan
+Write-Host "  PUA Removal ($puaBanner)  -  $mode" -ForegroundColor Cyan
 Write-Host "  Privilege: $ctx   Log: $LogPath" -ForegroundColor DarkGray
 if ($NoElevate -and -not (Test-Admin)) {
     Write-Host "  Scope: current user only (no elevation requested)" -ForegroundColor DarkGray
@@ -762,53 +835,9 @@ foreach ($u in $userRoots) {
     }
 }
 
-$extraPuas = @(
-    @{ Name='OpenBook';    Rx='(?i)\bOpenBook\b';    Proc=@('OpenBook');    Pub='';                       Nw=$true  },
-    @{ Name='ConvertMate'; Rx='(?i)\bConvertMate\b'; Proc=@('ConvertMate'); Pub='(?i)Amaryllis';           Nw=$false },
-    @{ Name='PDFEditor';   Rx='(?i)\bPDFEditor\b';   Proc=@('PDFEditor');   Pub='(?i)(AppSuite|Eclipse Media)'; Nw=$false },
-    # EpiBrowser / EpiStart - Chromium-clone PUA. Vendor folder is %LOCALAPPDATA%\EPISoftware (all-caps EPI), signed with an
-    # abused code-signing cert "Byte Media Sdn. Bhd." (Johor, MY); part of the TamperedChef shell-company cluster.
-    # Verified: todyl.com/blog/epibrowser, pcrisk.com/removal-guides/32056, file.net, any.run. Detections: Malwarebytes
-    # PUP.Optional.EpiBrowser, Sophos "Epi Browser (PUA)". Install: AppData\Local\EPISoftware\EpiBrowser\Application\<ver>\
-    # (epibrowser.exe, notification_helper.exe); stager Temp\epibrowser-bin\epibrowser.exe. Reg: HKCU\Software\EPISoftware\
-    # {EpiBrowser*,Update*} and HKCU\Software\Policies\EPISoftware\EpiBrowser. Tasks: EpiBrowserUpdate, EpiBrowserStartup.
-    # Verified full SHA256: installer 06b89c8a6bc45c652a12af9bddf17aed478f7bbd0c447a745c05f7486a7c2044,
-    #                       app       2fe2d16e51488337de25bb02c7ca4a06e2b7e3229cd2af9903db7c9efdf88e31.
-    # Name='EPISoftware' so the folder sweep removes the whole vendor tree (EpiBrowser + Application + Update). The broad Rx
-    # catches EpiBrowser/EpiStart artifacts (tasks, run-values, shortcuts) regardless of folder; notification_helper.exe is
-    # killed via path-match (under EPISoftware) rather than by generic process name to avoid touching other Chromium browsers.
-    @{ Name='EPISoftware'; Rx='(?i)(EPISoftware|EpiBrowser|Epi\s+Browser|EpiStart)'; Proc=@('epibrowser','setup.epibrowser'); Pub='(?i)(EPISoftware|EPI\s*Software)'; Nw=$false },
-    # OneStart / OneStart.ai - "AI browser" Chromium-clone PUA (browser hijacker/adware), TamperedChef/AppSuite/BaoLoader
-    # cluster (Unit42 CL-CRI-1089; same operators as EpiBrowser per Sophos/Truesec; shares C2 mka3e8.com). Spread via
-    # malvertising for free PDF tools. Signers: OneStart Technologies LLC / Caerus Media LLC / Apollo Technologies Inc (SSL.com).
-    # Verified: pcrisk.com/removal-guides/30436, todyl.com/blog/onestart-ai-browser-deception, any.run, file.net, advanceduninstaller.com.
-    # Install: %LOCALAPPDATA%\OneStart.ai\OneStart\{Application\<ver>,User Data}; also %APPDATA%\OneStart. Process onestart.exe.
-    # Reg: HKCU\Software\OneStart.ai; uninstall "OneStart.ai OneStart" + GUID {31F4B209-D4E1-41E0-A34F-35EFF7117AE8};
-    # StartMenuInternet\OneStart.6GNARUVKKH5IO36LFVEZWHOWXE. Run: OneStartChromium/OneStartBar/OneStartUpdate. Tasks:
-    # "OneStart Chromium/Updater/Maintenance/Cleanup" + randomized "sys_component_health_*" Node.js tasks. Toolbar: OneStartBar/DBar.
-    # Verified full SHA256: installer fb64aad28d17cf4ccae7297e85223674f43d583accc389dafb27947870f86cfd,
-    #                       app       246e8d6a45c989f0ae56d1145a2091c5677c6c8d476b733ed275957782f7c9c0,
-    #                       MSI       d2690d69627089f97e49461c55f195441ee6279f9b6ffa246c9fc4ae3e4c392a (any.run).
-    # Two entries: 'OneStart.ai' removes the Local vendor tree; 'OneStart' catches %APPDATA%\OneStart + Programs/Start-Menu folders.
-    # Rx '(?i)OneStart' covers OneStart.ai/OneStartBar/OneStartChromium/OneStartUpdate; generic Chromium helpers
-    # (notification_helper/chrome_proxy) are killed by path-match, NOT by name, to avoid touching legit browsers.
-    @{ Name='OneStart.ai'; Rx='(?i)OneStart'; Proc=@('onestart'); Pub='(?i)(OneStart\.ai|OneStart Technologies|Caerus Media)'; Nw=$false },
-    @{ Name='OneStart';    Rx='(?i)\bOneStart\b'; Proc=@(); Pub=''; Nw=$false },
-    # ManualFinder / ManualFinderApp / AllManualsFinder - trojanized "find product manuals" installer; TamperedChef / AppSuite /
-    # BaoLoader cluster, SAME operators as OneStart (G DATA/Expel/Sophos; shared C2 mka3e8.com, portal.manualfinder.app).
-    # NOT mere adware: infostealer/loader (Chromium cred+cookie theft, residential proxy) - treat a hit as a COMPROMISE IOC.
-    # ManualFinderApp.exe signed by "GLINT SOFTWARE SDN. BHD." (revoked). Detections: Sophos Mal/Isher-Gen / Troj/EvilAI-H,
-    # MS Trojan:Win64/InfoStealer!MSR. Install: %LOCALAPPDATA%\{ManualFinder, Programs\ManualFinder}; silent msiexec /qn /i
-    # ...\Temp\ManualFinder-v2.0.196.msi; persistence = scheduled task -> node.exe runs a GUID .js in %TEMP%. Siblings under
-    # %LOCALAPPDATA%\Programs\: AllManualsReader/OpenMyManual/ManualReaderPro/TotalUserManuals (caught by Rx).
-    # Verified: expel.com/.../you-dont-find-manualfinder..., sophos.com, gdatasoftware.com, lindensec.com, any.run, hybrid-analysis.
-    # Verified full SHA256: ManualFinderApp.exe        71edb9f9f757616fe62a49f2d5b55441f91618904517337abd9d0725b07c2a51,
-    #                       ManualFinder-v2.0.196.msi  ed797beb927738d68378cd718ea0dc74e605df0e66bd5670f557217720fb2871.
-    # Name='ManualFinder' sweeps Local + Roaming + Programs\ManualFinder. Generic loader processes (node/msiexec/mshta/
-    # powershell/cmd/svchost) are deliberately NOT in Proc - they are OS/legit; the malicious node.exe is caught by path-Rx.
-    @{ Name='ManualFinder'; Rx='(?i)(manualfinder|allmanualsfinder|allmanualsreader|openmymanual|manualreaderpro|totalusermanuals|pdfeditorupdater)'; Proc=@('ManualFinderApp','AllManualsReader','OpenMyManual','ManualReaderPro','TotalUserManuals'); Pub='(?i)(GLINT SOFTWARE SDN\.? BHD|GLINT By J SDN\.? BHD|ECHO\s*INFINI SDN\.? BHD|SUMMIT NEXUS Holdings)'; Nw=$false }
-)
-foreach ($pua in $extraPuas) {
+# --- per-PUA sweep ----------------------------------------------------------
+# PUA definitions live in the $Puas registry near the top of this script.
+foreach ($pua in $Puas) {
     $pd = New-Object System.Collections.Generic.List[string]
     foreach ($u in $userRoots) {
         $pd.Add((Join-Path $u "AppData\Local\$($pua.Name)"))
@@ -823,6 +852,113 @@ foreach ($pua in $extraPuas) {
     Invoke-PuaSweep -Name $pua.Name -Rx $pua.Rx -Proc $pua.Proc -Dirs $pua.Dirs -Pub $pua.Pub -Nw $pua.Nw
 }
 
+# ---------------------------------------------------------------------------
+#  Cluster cert sweep (upgrade #1): catch ANY app signed by a known abused
+#  cluster certificate, even one not yet listed in $Puas by name. Acts on
+#  Add/Remove-Programs entries (by Publisher), running processes (by signer),
+#  and dormant apps in user-writable install roots. $BadSignerRx is kept narrow
+#  (distinctive shell companies) so a signer match is safe to remove. DryRun-safe
+#  (Invoke-Action previews only). Skip with -SkipCertScan. NOTE: if the script
+#  self-elevates, the elevated instance runs the scan regardless (safe default).
+# ---------------------------------------------------------------------------
+function Invoke-CertSweep {
+    param([string]$SignerRx)
+    if (-not $SignerRx) { return }
+    Section "Cluster sweep - apps signed by known abused certificates"
+
+    $writableRoots = New-Object System.Collections.Generic.List[string]
+    foreach ($u in $userRoots) {
+        $writableRoots.Add((Join-Path $u 'AppData\Local'))
+        $writableRoots.Add((Join-Path $u 'AppData\Local\Programs'))
+        $writableRoots.Add((Join-Path $u 'AppData\Roaming'))
+    }
+    if ($env:ProgramData) { $writableRoots.Add($env:ProgramData) }
+    $writableRoots = @($writableRoots | Where-Object { $_ } | Select-Object -Unique)
+    # perf-only skip list (huge, known-clean dirs); they never match $SignerRx anyway
+    $skipDirs = '(?i)^(Temp|Microsoft|Packages|Google|Mozilla|NVIDIA Corporation|Comms|ConnectedDevicesPlatform|D3DSCache|CrashDumps|Microsoft Edge|Microsoft OneDrive)$'
+
+    function Get-Signer([string]$f) {
+        try { $s = Get-AuthenticodeSignature -LiteralPath $f -ErrorAction SilentlyContinue
+              if ($s -and $s.SignerCertificate) { return $s.SignerCertificate.Subject } } catch {}
+        return $null
+    }
+    function Get-AppRoot([string]$dir, $roots) {
+        if (-not $dir) { return $null }
+        $d = $dir.TrimEnd('\')
+        # most-specific (longest) root first, so ...\Local\Programs wins over ...\Local
+        foreach ($r in ($roots | Sort-Object Length -Descending)) {
+            $rr = $r.TrimEnd('\')
+            if ($d -like "$rr\*") {
+                $first = (($d.Substring($rr.Length + 1)) -split '\\')[0]
+                if ($first) { return (Join-Path $rr $first) }
+            }
+        }
+        return $null
+    }
+    $seen = @{}
+    function Remove-AppRoot([string]$root, [string]$why) {
+        if (-not $root -or $seen[$root]) { return }
+        $seen[$root] = $true
+        if (Test-Path -LiteralPath $root -ErrorAction SilentlyContinue) {
+            Invoke-Action "dir $root ($why)" { if (-not (Remove-PathForce $root)) { throw 'in use - could not remove' } }
+        }
+    }
+
+    # 1) Add/Remove-Programs entries whose Publisher matches a bad signer (registry; cheap)
+    $unList = New-Object System.Collections.Generic.List[string]
+    $unList.Add('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+    $unList.Add('HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
+    foreach ($r in $softwareHiveRoots) { $unList.Add("$r\Software\Microsoft\Windows\CurrentVersion\Uninstall") }
+    foreach ($ur in $unList) {
+        if (-not (Test-Path $ur -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $ur -ErrorAction SilentlyContinue | ForEach-Object {
+            $key = $_
+            try {
+                $ip = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+                if ($ip.Publisher -and ($ip.Publisher -match $SignerRx)) {
+                    Invoke-Action "uninstall entry $($key.PSChildName) [pub: $($ip.Publisher)]" { if (-not (Remove-RegForce $key.PSPath)) { throw 'key remained' } }
+                    if ($ip.InstallLocation) { Remove-AppRoot (Get-AppRoot $ip.InstallLocation $writableRoots) "bad-signer publisher" }
+                }
+            } catch {}
+        }
+    }
+
+    # 2) Running processes signed by a bad cert -> kill + remove their user-writable install folder
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+        $p = $_; $path = $null
+        try { $path = $p.Path } catch {}
+        if (-not $path) { return }
+        $subj = Get-Signer $path
+        if ($subj -and ($subj -match $SignerRx)) {
+            Invoke-Action "kill $($p.ProcessName) (PID $($p.Id)) [bad signer]" {
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                & taskkill.exe /PID $p.Id /T /F *> $null
+            }
+            Remove-AppRoot (Get-AppRoot (Split-Path -Parent $path) $writableRoots) "bad-signer process"
+        }
+    }
+
+    # 3) Dormant apps: scan immediate child folders under user-writable roots; sign-check a few binaries each
+    foreach ($r in $writableRoots) {
+        if (-not (Test-Path -LiteralPath $r -ErrorAction SilentlyContinue)) { continue }
+        Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $appDir = $_.FullName
+            # skip nested writable-roots (e.g. don't treat ...\Local\Programs as one app folder)
+            if ($seen[$appDir] -or ($_.Name -match $skipDirs) -or ($writableRoots -contains $appDir)) { return }
+            $hit = $null
+            try {
+                Get-ChildItem -LiteralPath $appDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -eq '.exe' -or $_.Extension -eq '.dll' } |
+                    Select-Object -First 6 | ForEach-Object {
+                        if (-not $hit) { $s = Get-Signer $_.FullName; if ($s -and ($s -match $SignerRx)) { $hit = $s } }
+                    }
+            } catch {}
+            if ($hit) { Remove-AppRoot $appDir "bad-signer binary" }
+        }
+    }
+}
+if (-not $SkipCertScan) { Invoke-CertSweep -SignerRx $BadSignerRx }
+
 Section "Verification"
 $residual = @()
 foreach ($k in $vendorKeys) { if (Test-Path $k -ErrorAction SilentlyContinue) { $residual += "reg: $k" } }
@@ -836,7 +972,7 @@ Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
     Where-Object { "$($_.Name) $($_.DisplayName) $($_.PathName)" -match $PulseRegex } |
     ForEach-Object { $residual += "svc: $($_.Name)" }
 
-foreach ($pua in $extraPuas) {
+foreach ($pua in $Puas) {
     foreach ($d in ($pua.Dirs | Select-Object -Unique)) { if (Test-Path -LiteralPath $d -ErrorAction SilentlyContinue) { $residual += "dir: $d" } }
     if ($hasSchedCmd) {
         Get-ScheduledTask -ErrorAction SilentlyContinue |
@@ -852,7 +988,7 @@ if ($DryRun) {
     Write-Host "    (DryRun) reflects current state, not post-removal." -ForegroundColor DarkYellow
 }
 if ($residual.Count -eq 0) {
-    Write-Host "    No PUA artifacts detected (Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser / OneStart / ManualFinder)." -ForegroundColor Green
+    Write-Host "    No PUA artifacts detected ($puaBanner)." -ForegroundColor Green
 } else {
     Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
@@ -865,21 +1001,8 @@ if ($Harden) {
         $vaxPaths.Add((Join-Path $u 'AppData\Local\PulseSoftware'))
         $vaxPaths.Add((Join-Path $u 'AppData\Local\Pulse Browser'))
         $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PulseSoftware'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\OpenBook'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\OpenBook'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\ConvertMate'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\PDFEditor'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PDFEditor'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\PDFEditor'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\EPISoftware'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\EPISoftware'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\EPISoftware'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\OneStart.ai'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\OneStart'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\OneStart.ai'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\ManualFinder'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\ManualFinder'))
-        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\ManualFinder'))
+        # per-PUA reinstall-blockers, derived from each $Puas entry's Harden list
+        foreach ($p in $Puas) { foreach ($rel in $p.Harden) { $vaxPaths.Add((Join-Path $u "AppData\$rel")) } }
     }
     foreach ($vp in ($vaxPaths | Select-Object -Unique)) {
         $parent = Split-Path -Parent $vp

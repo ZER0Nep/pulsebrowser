@@ -765,7 +765,19 @@ foreach ($u in $userRoots) {
 $extraPuas = @(
     @{ Name='OpenBook';    Rx='(?i)\bOpenBook\b';    Proc=@('OpenBook');    Pub='';                       Nw=$true  },
     @{ Name='ConvertMate'; Rx='(?i)\bConvertMate\b'; Proc=@('ConvertMate'); Pub='(?i)Amaryllis';           Nw=$false },
-    @{ Name='PDFEditor';   Rx='(?i)\bPDFEditor\b';   Proc=@('PDFEditor');   Pub='(?i)(AppSuite|Eclipse Media)'; Nw=$false }
+    @{ Name='PDFEditor';   Rx='(?i)\bPDFEditor\b';   Proc=@('PDFEditor');   Pub='(?i)(AppSuite|Eclipse Media)'; Nw=$false },
+    # EpiBrowser / EpiStart - Chromium-clone PUA. Vendor folder is %LOCALAPPDATA%\EPISoftware (all-caps EPI), signed with an
+    # abused code-signing cert "Byte Media Sdn. Bhd." (Johor, MY); part of the TamperedChef shell-company cluster.
+    # Verified: todyl.com/blog/epibrowser, pcrisk.com/removal-guides/32056, file.net, any.run. Detections: Malwarebytes
+    # PUP.Optional.EpiBrowser, Sophos "Epi Browser (PUA)". Install: AppData\Local\EPISoftware\EpiBrowser\Application\<ver>\
+    # (epibrowser.exe, notification_helper.exe); stager Temp\epibrowser-bin\epibrowser.exe. Reg: HKCU\Software\EPISoftware\
+    # {EpiBrowser*,Update*} and HKCU\Software\Policies\EPISoftware\EpiBrowser. Tasks: EpiBrowserUpdate, EpiBrowserStartup.
+    # Verified full SHA256: installer 06b89c8a6bc45c652a12af9bddf17aed478f7bbd0c447a745c05f7486a7c2044,
+    #                       app       2fe2d16e51488337de25bb02c7ca4a06e2b7e3229cd2af9903db7c9efdf88e31.
+    # Name='EPISoftware' so the folder sweep removes the whole vendor tree (EpiBrowser + Application + Update). The broad Rx
+    # catches EpiBrowser/EpiStart artifacts (tasks, run-values, shortcuts) regardless of folder; notification_helper.exe is
+    # killed via path-match (under EPISoftware) rather than by generic process name to avoid touching other Chromium browsers.
+    @{ Name='EPISoftware'; Rx='(?i)(EPISoftware|EpiBrowser|Epi\s+Browser|EpiStart)'; Proc=@('epibrowser','setup.epibrowser'); Pub='(?i)(EPISoftware|EPI\s*Software)'; Nw=$false }
 )
 foreach ($pua in $extraPuas) {
     $pd = New-Object System.Collections.Generic.List[string]
@@ -811,7 +823,7 @@ if ($DryRun) {
     Write-Host "    (DryRun) reflects current state, not post-removal." -ForegroundColor DarkYellow
 }
 if ($residual.Count -eq 0) {
-    Write-Host "    No PUA artifacts detected (Pulse / OpenBook / ConvertMate / PDFEditor)." -ForegroundColor Green
+    Write-Host "    No PUA artifacts detected (Pulse / OpenBook / ConvertMate / PDFEditor / EpiBrowser)." -ForegroundColor Green
 } else {
     Write-Host "    Remaining (locked/permissioned - close the listed owner and re-run):" -ForegroundColor Yellow
     $residual | ForEach-Object { Write-Host "      - $_" -ForegroundColor Yellow }
@@ -830,6 +842,9 @@ if ($Harden) {
         $vaxPaths.Add((Join-Path $u 'AppData\Local\PDFEditor'))
         $vaxPaths.Add((Join-Path $u 'AppData\Roaming\PDFEditor'))
         $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\PDFEditor'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\EPISoftware'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Roaming\EPISoftware'))
+        $vaxPaths.Add((Join-Path $u 'AppData\Local\Programs\EPISoftware'))
     }
     foreach ($vp in ($vaxPaths | Select-Object -Unique)) {
         $parent = Split-Path -Parent $vp

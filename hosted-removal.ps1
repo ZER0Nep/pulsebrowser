@@ -124,6 +124,15 @@ $Puas = @(
     @{ Name='OneStart.ai'; Label='OneStart'; Rx='(?i)OneStart'; Proc=@('onestart'); Pub='(?i)(OneStart\.ai|OneStart Technologies|Caerus Media)'; Nw=$false; Harden=@('Local\OneStart.ai','Roaming\OneStart','Local\Programs\OneStart.ai') },
     @{ Name='OneStart';    Label='';         Rx='(?i)\bOneStart\b'; Proc=@(); Pub=''; Nw=$false; Harden=@() },
 
+    # ProOneStartHub / ProOneStartPDF - rebranded OneStart distribution (installers proonestarthub.msi / proonestartpdf.msi); same
+    # TamperedChef/AppSuite cluster, DROPS onestart.exe - so the runtime process and the OneStart vendor tree are ALREADY covered by
+    # the OneStart entries above (onestart.exe in Proc; "ProOneStartHub" matches the OneStart-substring Rx). Pushed via Google
+    # malvertising from proonestarthub.com (redirect/C2 brightfuturedevpers.org). Tagged adware/advancedinstaller/loader+stealer on
+    # any.run / Joe Sandbox (proonestarthub.msi, proonestartpdf.msi). This entry adds a banner label, hardens the branded
+    # install/uninstall folder against reinstall, and serves as a regression anchor; it intentionally lists no Proc (the live
+    # process is onestart.exe, killed above) and no Pub (signer rotates; the cert sweep + OneStart Pub cover that).
+    @{ Name='ProOneStartHub'; Label='ProOneStartHub'; Rx='(?i)(ProOneStartHub|ProOneStartPDF)'; Proc=@(); Pub=''; Nw=$false; Harden=@('Local\ProOneStartHub','Roaming\ProOneStartHub','Local\Programs\ProOneStartHub') },
+
     # ManualFinder / ManualFinderApp / AllManualsFinder - trojanized "find product manuals" installer; TamperedChef/AppSuite/BaoLoader,
     # SAME operators as OneStart (G DATA/Expel/Sophos; shared C2 mka3e8.com). NOT mere adware: infostealer/loader (Chromium cred+cookie
     # theft, residential proxy) - treat a hit as a COMPROMISE IOC. ManualFinderApp.exe signed by "GLINT SOFTWARE SDN. BHD." (revoked).
